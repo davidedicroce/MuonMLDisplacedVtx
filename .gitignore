@@ -3,6 +3,10 @@
 .asetup.save
 athena/
 build/
+BucketDumperConfigs/athena/
+BucketDumperConfigs/build/
+BucketDumperConfigs/data*/
+BucketDumperConfigs/.asetup.save
 data*/
 hdd_data
 models/
