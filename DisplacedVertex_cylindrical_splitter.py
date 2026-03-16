@@ -1,220 +1,48 @@
 #!/usr/bin/env python3
-
 """
-Prepare and save a deterministic train/val split for the displaced vertex
-cylindrical-coordinate dataset.
-
-This matches the output of DisplacedVertex_cylindrical_converter.py.
-
-Expected node features:
-    x[:, :] = [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
-
-Expected target:
-    y_vertex = [rho, phi, z]
-
-Example
--------
-python DisplacedVertex_cylindrical_splitter.py \
-  --data-glob "./data_cylindrical/displaced_vertex_dataset_part*.h5" \
-  --val-fraction 0.1 \
-  --seed 12345 \
-  --out ./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz
-
-Later in training:
-  split = np.load("./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz", allow_pickle=True)
-  train_idx = split["train_idx"]
-  val_idx   = split["val_idx"]
-
-  train_ds = torch.utils.data.Subset(dataset, train_idx)
-  val_ds   = torch.utils.data.Subset(dataset, val_idx)
+Prepare and save a deterministic train/val split for the displaced vertex cylindrical dataset.
 """
 
 import argparse
 import glob
-import os
 from pathlib import Path
 
-import h5py
 import numpy as np
-import torch
-from torch.utils.data import Dataset
 
+from dv_training_utils import H5EventDataset
 
-# ------------------------------------------------------------
-# Dataset loader (matches DisplacedVertex_cylindrical_converter output)
-# ------------------------------------------------------------
-
-class H5CylindricalEventDataset(Dataset):
-    """
-    Dataset for displaced vertex graph data with cylindrical target coordinates.
-
-    Expected structure in H5:
-        /events/<id>/
-            x
-            edge_index
-            edge_attr
-            y_vertex
-
-    Expected semantics:
-        x        : node features in polar form
-        y_vertex : target vertex in cylindrical form [rho, phi, z]
-    """
-
-    def __init__(self, h5_paths):
-        self.h5_paths = list(h5_paths)
-        if not self.h5_paths:
-            raise ValueError("No H5 files provided.")
-
-        self.index = []
-
-        for fi, p in enumerate(self.h5_paths):
-            with h5py.File(p, "r") as f:
-                if "events" not in f:
-                    continue
-
-                keys = sorted(list(f["events"].keys()))
-                for k in keys:
-                    self.index.append((fi, k))
-
-        if not self.index:
-            raise ValueError("No events found in provided H5 files.")
-
-        self._files = None
-        self._pid = None
-
-    def __len__(self):
-        return len(self.index)
-
-    def _ensure_open(self):
-        pid = os.getpid()
-
-        if self._files is not None and self._pid == pid:
-            return
-
-        if self._files is not None:
-            for f in self._files:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-
-        self._pid = pid
-        self._files = [h5py.File(p, "r") for p in self.h5_paths]
-
-    def __getitem__(self, idx):
-        self._ensure_open()
-
-        fi, k = self.index[idx]
-        f = self._files[fi]
-        g = f["events"][k]
-
-        x = torch.from_numpy(g["x"][...]).float()
-        edge_index = torch.from_numpy(g["edge_index"][...]).long()
-        edge_attr = torch.from_numpy(g["edge_attr"][...]).float()
-
-        if "y_vertex" not in g:
-            raise RuntimeError(
-                f"Missing 'y_vertex' in {self.h5_paths[fi]} /events/{k}"
-            )
-
-        y_vertex = torch.from_numpy(g["y_vertex"][...]).float()
-
-        # Optional consistency checks
-        if x.ndim != 2:
-            raise RuntimeError(
-                f"Expected node feature matrix with shape [N, F], got shape {tuple(x.shape)} "
-                f"in {self.h5_paths[fi]} /events/{k}"
-            )
-
-        if x.shape[1] != 7:
-            raise RuntimeError(
-                f"Expected 7 node features "
-                f"[r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF], "
-                f"got {x.shape[1]} in {self.h5_paths[fi]} /events/{k}"
-            )
-
-        if y_vertex.numel() != 3:
-            raise RuntimeError(
-                f"Expected cylindrical target y_vertex = [rho, phi, z], "
-                f"got shape {tuple(y_vertex.shape)} in {self.h5_paths[fi]} /events/{k}"
-            )
-
-        return {
-            "x": x,
-            "edge_index": edge_index,
-            "edge_attr": edge_attr,
-            "y_vertex": y_vertex,
-        }
-
-
-# ------------------------------------------------------------
-# Split creation
-# ------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-
-    ap.add_argument(
-        "--data-glob",
-        required=True,
-        help='Glob for H5 files, e.g. "./data_cylindrical/displaced_vertex_dataset_part*.h5"',
-    )
-
-    ap.add_argument(
-        "--val-fraction",
-        type=float,
-        default=0.1,
-        help="Fraction of events used for validation",
-    )
-
-    ap.add_argument(
-        "--seed",
-        type=int,
-        default=12345,
-        help="Random seed for deterministic split",
-    )
-
-    ap.add_argument(
-        "--out",
-        required=True,
-        help="Output split file (.npz)",
-    )
-
-    ap.add_argument(
-        "--max-train-events",
-        type=int,
-        default=-1,
-        help="Optional cap for train size (debug)",
-    )
-
+    ap.add_argument("--data-glob", required=True, help='Glob for H5 files, e.g. "./data_cylindrical/displaced_vertex_dataset_part*.h5"')
+    ap.add_argument("--val-fraction", type=float, default=0.1, help="Fraction of events used for validation")
+    ap.add_argument("--seed", type=int, default=12345, help="Random seed for deterministic split")
+    ap.add_argument("--out", required=True, help="Output split file (.npz)")
+    ap.add_argument("--max-train-events", type=int, default=-1, help="Optional cap for train size (debug)")
     args = ap.parse_args()
 
     if not (0.0 < args.val_fraction < 1.0):
         raise SystemExit("--val-fraction must be in the open interval (0, 1)")
 
     paths = sorted(glob.glob(args.data_glob))
-
     if not paths:
         raise SystemExit(f"No H5 files matched: {args.data_glob}")
 
     print(f"[i] found {len(paths)} H5 files")
 
-    ds = H5CylindricalEventDataset(paths)
-
+    ds = H5EventDataset(paths)
     n = len(ds)
-
     if n < 2:
         raise SystemExit("Not enough events to split")
 
     print(f"[i] total events: {n}")
 
     rng = np.random.RandomState(args.seed)
-
     indices = np.arange(n, dtype=np.int64)
     rng.shuffle(indices)
 
     n_val = max(1, int(args.val_fraction * n))
-    n_val = min(n_val, n - 1)  # always leave at least one event for training
+    n_val = min(n_val, n - 1)
 
     val_idx = indices[:n_val]
     train_idx = indices[n_val:]
