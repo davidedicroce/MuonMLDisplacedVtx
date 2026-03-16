@@ -4,6 +4,19 @@ DisplacedVertex_cylindrical_converter.py
 
 Node features: [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
 Target: y_vertex = [rho, phi, z]  (m, rad, m)
+
+Example:
+python -u DisplacedVertex_cylindrical_converter.py \
+    --input-dir hdd_data/ \
+    --pattern "MuonBucketDump_H*/outputs/MuonBucketDump_group.det-muon.*root" \
+    --output-dir ./data_cylindrical \
+    --output-name displaced_vertex_dataset \
+    --vertex-r-max-mm 8000.0 \
+    --vertex-z-max-mm 12000.0 \
+    --calo-r-max-mm 4250 \
+    --calo-z-max-mm 6500 \
+    --min-tower-energy-mev 1000 \
+    --max-tower-segment-dr 0.4
 """
 
 import argparse

@@ -152,6 +152,27 @@ def _read_tree(root_file: str, tree_name: str, required_branches):
     return td, ev_to_idx, unique_keys
 
 
+def _dataset_name_from_root_path(root_path: str) -> str:
+    """
+    Build a compact dataset label from the ROOT file location.
+
+    Priority:
+      1) parent directory name (common production layout)
+      2) ROOT file stem
+
+    If the name starts with known prefixes like "MuonBucketDump_",
+    the prefix is removed so the label is concise.
+    """
+    p = Path(root_path)
+    raw = p.parent.name if p.parent.name else p.stem
+
+    for prefix in ("MuonBucketDump_", "MuonSegmentDump_"):
+        if raw.startswith(prefix) and len(raw) > len(prefix):
+            return raw[len(prefix):]
+
+    return raw
+
+
 # -------------------------------------------------------
 # Geometry helpers
 # -------------------------------------------------------
@@ -273,7 +294,12 @@ def _event_passes_vertex_envelope(vertex_td, idxs, vertex_r_max_mm, vertex_z_max
     y = np.asarray(all_y, dtype=np.float32)
     z = np.asarray(all_z, dtype=np.float32)
     r = np.sqrt(x * x + y * y)
-    inside = (r <= vertex_r_max_mm) & (np.abs(z) <= vertex_z_max_mm)
+    # Keep event only if truth vertices are:
+    #   - outside the beam pipe region: rho > 0.3 m = 300 mm
+    #   - inside the requested envelope cuts 
+    min_vertex_r_mm = 300.0
+    inside = (r > min_vertex_r_mm) & (r <= vertex_r_max_mm) & (np.abs(z) <= vertex_z_max_mm)
+
     return bool(np.all(inside))
 
 
@@ -557,10 +583,13 @@ def _write_event_group(
     muon_bucket=None,
     tower_xyz_m=None,
     tower_min_dr=None,
+    dataset_name=None,
 ):
     g.attrs["event_hash"] = np.asarray(event_hash, dtype=np.int64)
     g.attrs["n_muon_nodes"] = int(n_muon_nodes)
     g.attrs["n_calo_nodes"] = int(n_calo_nodes)
+    if dataset_name is not None:
+        g.attrs["dataset_name"] = str(dataset_name)
 
     g.create_dataset("x", data=x, compression="gzip", compression_opts=4)
     g.create_dataset("edge_index", data=edge_index, compression="gzip", compression_opts=4)
@@ -655,6 +684,7 @@ def run_converter_main_loop(args, build_vertex_target_fn, build_muon_nodes_fn, b
 
     for root_path in files:
         print(f"[i] reading {root_path}")
+        dataset_name = _dataset_name_from_root_path(root_path)
 
         try:
             mu_td, mu_ev_to_idx, mu_keys = _read_tree(root_path, "MuonBucketDump", REQUIRED_MUON_BRANCHES)
@@ -815,6 +845,7 @@ def run_converter_main_loop(args, build_vertex_target_fn, build_muon_nodes_fn, b
                 muon_bucket=muon_bucket,
                 tower_xyz_m=tower_xyz_m,
                 tower_min_dr=tower_min_dr,
+                dataset_name=dataset_name,
             )
 
             total_written += 1

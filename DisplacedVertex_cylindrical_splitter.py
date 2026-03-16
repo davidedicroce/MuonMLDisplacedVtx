@@ -1,15 +1,70 @@
 #!/usr/bin/env python3
 """
-Prepare and save a deterministic train/val split for the displaced vertex cylindrical dataset.
+Prepare and save a deterministic train/val split for the displaced vertex
+cylindrical-coordinate dataset.
+
+This matches the output of DisplacedVertex_cylindrical_converter.py.
+
+Expected node features:
+        x[:, :] = [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
+
+Expected target:
+        y_vertex = [rho, phi, z]
+
+Example
+-------
+python DisplacedVertex_cylindrical_splitter.py \
+    --data-glob "./data_cylindrical/displaced_vertex_dataset_part*.h5" \
+    --val-fraction 0.1 \
+    --seed 12345 \
+    --out ./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz
+
+Later in training:
+    split = np.load("./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz", allow_pickle=True)
+    train_idx = split["train_idx"]
+    val_idx   = split["val_idx"]
+
+    train_ds = torch.utils.data.Subset(dataset, train_idx)
+    val_ds   = torch.utils.data.Subset(dataset, val_idx)
 """
 
 import argparse
 import glob
 from pathlib import Path
 
+import h5py
 import numpy as np
 
 from dv_training_utils import H5EventDataset
+
+
+def _decode_h5_attr(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    if isinstance(v, np.bytes_):
+        return v.tobytes().decode("utf-8", errors="replace")
+    return str(v)
+
+
+def _read_dataset_names(paths):
+    names = []
+    for p in paths:
+        with h5py.File(p, "r") as f:
+            if "events" not in f:
+                continue
+            for k in sorted(f["events"].keys()):
+                g = f["events"][k]
+                raw_name = g.attrs.get("dataset_name", "unknown")
+                names.append(_decode_h5_attr(raw_name))
+    return np.asarray(names, dtype=object)
+
+
+def _print_split_dataset_summary(tag, names):
+    uniq, counts = np.unique(names, return_counts=True)
+    print(f"[i] {tag} dataset composition ({len(uniq)} datasets):")
+    order = np.argsort(counts)[::-1]
+    for i in order:
+        print(f"    {uniq[i]}: {int(counts[i])}")
 
 
 def main():
@@ -35,6 +90,13 @@ def main():
     if n < 2:
         raise SystemExit("Not enough events to split")
 
+    dataset_names = _read_dataset_names(paths)
+    if len(dataset_names) != n:
+        raise SystemExit(
+            f"Dataset-name metadata mismatch: read {len(dataset_names)} names for {n} events. "
+            "Please regenerate H5 files with updated converter."
+        )
+
     print(f"[i] total events: {n}")
 
     rng = np.random.RandomState(args.seed)
@@ -49,6 +111,9 @@ def main():
 
     if args.max_train_events > 0:
         train_idx = train_idx[: args.max_train_events]
+
+    train_dataset_names = dataset_names[train_idx]
+    val_dataset_names = dataset_names[val_idx]
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,6 +130,9 @@ def main():
         h5_paths=abs_paths,
         n_events=np.int64(n),
         coordinate_system=np.array("cylindrical", dtype=object),
+        dataset_name_by_index=dataset_names,
+        train_dataset_names=train_dataset_names,
+        val_dataset_names=val_dataset_names,
         node_feature_order=np.array(
             [
                 "r",
@@ -83,6 +151,8 @@ def main():
     print(f"[ok] wrote split file: {out_path}")
     print(f"[i] train events: {len(train_idx)}")
     print(f"[i] val events: {len(val_idx)}")
+    _print_split_dataset_summary("train", train_dataset_names)
+    _print_split_dataset_summary("val", val_dataset_names)
 
 
 if __name__ == "__main__":
