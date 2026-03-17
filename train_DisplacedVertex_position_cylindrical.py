@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 DDP multi-GPU training for displaced-vertex graph regression
-using polar node features and polar target coordinates.
+using polar node features and cylindrical target coordinates.
 
 Target convention:
-    y_vertex = [r, theta, phi]
+    y_vertex = [rho, phi, z]
 
 Node feature convention:
     x[:, :] = [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
 
 Example:
-torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py \
-    --data-glob "./data_polar/displaced_vertex_dataset_part*.h5" \
-    --split-file "./data_polar/split_displaced_vertex_polar_seed12345.npz" \
+torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_position_cylindrical.py \
+    --data-glob "./data_cylindrical/displaced_vertex_dataset_part*.h5" \
+    --split-file "./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz" \
     --epochs 200 \
     --lr 2e-4 \
     --hidden-dim 128 \
@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py
     --pin-memory \
     --wandb \
     --wandb-project "DisplacedVertex" \
-    --wandb-name "dv_polar_regression_v1" \
+    --wandb-name "dv_cylindrical_regression_v1" \
     --early-stop \
     --fourier \
     --weight-decay 0.02 \
@@ -32,7 +32,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py
     --ema \
     --ema-decay 0.999 \
     --save-dir "models" \
-    --save "displaced_vertex_polar_gnn.pt"
+    --save "displaced_vertex_cylindrical_gnn.pt"
 """
 
 import argparse
@@ -40,13 +40,13 @@ import argparse
 from dv_training_utils import add_training_args, run_training, ddp_cleanup
 
 
-COORDINATE_SYSTEM = "polar"
-TARGET_LABELS = ["r", "theta", "phi"]
+COORDINATE_SYSTEM = "cylindrical"
+TARGET_LABELS     = ["rho", "phi", "z"]
 
 EXAMPLE = """Example:
-torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py \\
-    --data-glob "./data_polar/displaced_vertex_dataset_part*.h5" \\
-    --split-file "./data_polar/split_displaced_vertex_polar_seed12345.npz" \\
+torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_position_cylindrical.py \\
+    --data-glob "./data_cylindrical/displaced_vertex_dataset_part*.h5" \\
+    --split-file "./data_cylindrical/split_displaced_vertex_cylindrical_seed12345.npz" \\
     --epochs 200 \\
     --lr 2e-4 \\
     --hidden-dim 128 \\
@@ -57,7 +57,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py
     --pin-memory \\
     --wandb \\
     --wandb-project "DisplacedVertex" \\
-    --wandb-name "dv_polar_regression_v1" \\
+    --wandb-name "dv_cylindrical_regression_v1" \\
     --early-stop \\
     --fourier \\
     --weight-decay 0.02 \\
@@ -66,7 +66,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py
     --ema \\
     --ema-decay 0.999 \\
     --save-dir "models" \\
-    --save "displaced_vertex_polar_gnn.pt"
+    --save "displaced_vertex_cylindrical_gnn.pt"
 """
 
 
@@ -74,13 +74,13 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "DDP multi-GPU training for displaced-vertex graph regression "
-            "using polar node features and polar target coordinates."
+            "using polar node features and cylindrical target coordinates."
         ),
         epilog=EXAMPLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_training_args(ap)
-    ap.set_defaults(save="displaced_vertex_polar_gnn.pt")
+    ap.set_defaults(save="displaced_vertex_cylindrical_gnn.pt")
     args = ap.parse_args()
     run_training(args, coordinate_system=COORDINATE_SYSTEM, target_labels=TARGET_LABELS)
 

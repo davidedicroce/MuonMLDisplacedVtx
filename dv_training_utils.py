@@ -4,8 +4,8 @@ dv_training_utils.py
 
 Shared utilities for DisplacedVertex training scripts:
   train_DisplacedVertex_position.py
-  train_DisplacedVertex_cylindrical_position.py
-  train_DisplacedVertex_polar_position.py
+  train_DisplacedVertex_position_cylindrical.py
+  train_DisplacedVertex_position_polar.py
 
 Contains:
   - Utility and DDP helpers

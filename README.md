@@ -24,17 +24,23 @@ The project builds graph-based event representations for displaced-vertex regres
 
 ## Main Files
 
-- DisplacedVertex_converter.py
-	- Converts ROOT files into Cartesian HDF5 graph datasets under ./data.
-- DisplacedVertex_polar_converter.py
-	- Converts ROOT files into polar-coordinate HDF5 graph datasets under ./data_polar.
-- DisplacedVertex_splitter.py
-	- Creates deterministic train/val split files for Cartesian datasets.
-- DisplacedVertex_polar_splitter.py
-	- Creates deterministic train/val split files for polar datasets.
+- DisplacedVertex_converter_cartesian.py
+        - Converts ROOT files into Cartesian HDF5 graph datasets under ./data.
+- DisplacedVertex_converter_cylindrical.py
+        - Converts ROOT files into cylindrical-coordinate HDF5 graph datasets under ./data_cylindrical.
+- DisplacedVertex_converter_polar.py
+        - Converts ROOT files into polar-coordinate HDF5 graph datasets under ./data_polar.
+- DisplacedVertex_splitter_cartesian.py
+        - Creates deterministic train/val split files for Cartesian datasets.
+- DisplacedVertex_splitter_cylindrical.py
+        - Creates deterministic train/val split files for cylindrical datasets.
+- DisplacedVertex_splitter_polar.py
+        - Creates deterministic train/val split files for polar datasets.
 - train_DisplacedVertex_position.py
-	- Trains the Cartesian regression model with DDP.
-- train_DisplacedVertex_polar_position.py
+        - Trains the Cartesian regression model with DDP.
+- train_DisplacedVertex_position_cylindrical.py
+        - Trains the cylindrical regression model with DDP.
+- train_DisplacedVertex_position_polar.py
 	- Trains the polar regression model with DDP.
 
 ## Prerequisites
@@ -78,7 +84,7 @@ Choose one pipeline (Cartesian or Polar). The order is always:
 1. Convert to polar dataset
 
 ```bash
-python -u DisplacedVertex_polar_converter.py \
+python -u DisplacedVertex_converter_polar.py \
 	--input-dir hdd_data/ \
 	--pattern "MuonBucketDump_H*/outputs/MuonBucketDump_group.det-muon.*root" \
 	--output-dir ./data_polar \
@@ -94,7 +100,7 @@ python -u DisplacedVertex_polar_converter.py \
 2. Build train/val split
 
 ```bash
-python DisplacedVertex_polar_splitter.py \
+python DisplacedVertex_splitter_polar.py \
 	--data-glob "./data_polar/displaced_vertex_dataset_part*.h5" \
 	--val-fraction 0.1 \
 	--seed 12345 \
@@ -104,7 +110,7 @@ python DisplacedVertex_polar_splitter.py \
 3. Train polar model (multi-GPU)
 
 ```bash
-torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py \
+torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_position_polar.py \
 	--data-glob "./data_polar/displaced_vertex_dataset_part*.h5" \
 	--split-file "./data_polar/split_displaced_vertex_polar_seed12345.npz" \
 	--epochs 200 \
@@ -133,7 +139,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_polar_position.py
 1. Convert to Cartesian dataset
 
 ```bash
-python -u DisplacedVertex_converter.py \
+python -u DisplacedVertex_converter_cartesian.py \
 	--input-dir hdd_data/ \
 	--pattern "MuonBucketDump_H*/outputs/MuonBucketDump_group.det-muon.*root" \
 	--output-dir ./data \
@@ -149,7 +155,7 @@ python -u DisplacedVertex_converter.py \
 2. Build train/val split
 
 ```bash
-python DisplacedVertex_splitter.py \
+python DisplacedVertex_splitter_cartesian.py \
 	--data-glob "./data/displaced_vertex_dataset_part*.h5" \
 	--val-fraction 0.1 \
 	--seed 12345 \

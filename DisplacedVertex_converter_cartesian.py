@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DisplacedVertex_converter.py  (Cartesian coordinates)
+DisplacedVertex_converter_cartesian.py
 
 Node features: [pos_x, pos_y, pos_z, dir_x, dir_y, dir_z, energy_like, nDoF]
 Target: y_vertex = [x, y, z]  (mm -> m)

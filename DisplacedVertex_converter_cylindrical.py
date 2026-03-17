@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
-DisplacedVertex_polar_converter.py
+DisplacedVertex_converter_cylindrical.py
 
 Node features: [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
-Target: y_vertex = [r, theta, phi]  (m, rad, rad)
+Target: y_vertex = [rho, phi, z]  (m, rad, m)
+
+Example:
+python -u DisplacedVertex_converter_cylindrical.py \
+    --input-dir hdd_data/ \
+    --pattern "MuonBucketDump_H*/outputs/MuonBucketDump_group.det-muon.*root" \
+    --output-dir ./data_cylindrical \
+    --output-name displaced_vertex_dataset \
+    --vertex-r-max-mm 8000.0 \
+    --vertex-z-max-mm 12000.0 \
+    --calo-r-max-mm 4250 \
+    --calo-z-max-mm 6500 \
+    --min-tower-energy-mev 1000 \
+    --max-tower-segment-dr 0.4
 """
 
 import argparse
@@ -14,13 +27,14 @@ from dv_converter_utils import (
     _collect_calo_filtered,
     _cartesian_to_atlas_position_polar,
     _cartesian_to_atlas_direction_angles,
+    _cartesian_to_cylindrical,
     add_converter_args,
     run_converter_main_loop,
 )
 
 
 def _build_vertex_target(vertex_td, idxs):
-    """Return [r, theta, phi] in polar coordinates (metres/radians)."""
+    """Return [rho, phi, z] in cylindrical coordinates (metres/radians)."""
     for i in idxs:
         xs = np.asarray(vertex_td["truthMuonVertexPositionX"][i]).ravel()
         ys = np.asarray(vertex_td["truthMuonVertexPositionY"][i]).ravel()
@@ -35,8 +49,8 @@ def _build_vertex_target(vertex_td, idxs):
             x_m = np.float32(x) / 1000.0
             y_m = np.float32(y) / 1000.0
             z_m = np.float32(z) / 1000.0
-            r, theta, phi = _cartesian_to_atlas_position_polar(x_m, y_m, z_m)
-            return np.asarray([r, theta, phi], dtype=np.float32)
+            rho, phi, zc = _cartesian_to_cylindrical(x_m, y_m, z_m)
+            return np.asarray([rho, phi, zc], dtype=np.float32)
     return None
 
 
@@ -131,7 +145,7 @@ def _build_calo_nodes(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Convert ROOT -> HDF5 graphs (polar target, spherical node coords)"
+        description="Convert ROOT -> HDF5 graphs (cylindrical target, spherical node coords)"
     )
     add_converter_args(ap)
     args = ap.parse_args()

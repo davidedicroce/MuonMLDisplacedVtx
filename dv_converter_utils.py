@@ -3,9 +3,9 @@
 dv_converter_utils.py
 
 Shared utilities for DisplacedVertex converter scripts:
-  DisplacedVertex_converter.py
-  DisplacedVertex_cylindrical_converter.py
-  DisplacedVertex_polar_converter.py
+  DisplacedVertex_converter_cartesian.py
+  DisplacedVertex_converter_cylindrical.py
+  DisplacedVertex_converter_polar.py
 
 Contains:
   - Required branch lists
@@ -295,9 +295,9 @@ def _event_passes_vertex_envelope(vertex_td, idxs, vertex_r_max_mm, vertex_z_max
     z = np.asarray(all_z, dtype=np.float32)
     r = np.sqrt(x * x + y * y)
     # Keep event only if truth vertices are:
-    #   - outside the beam pipe region: rho > 0.3 m = 300 mm
+    #   - outside the beam pipe region: rho > 0.3 m = 30 mm
     #   - inside the requested envelope cuts 
-    min_vertex_r_mm = 300.0
+    min_vertex_r_mm = 30.0
     inside = (r > min_vertex_r_mm) & (r <= vertex_r_max_mm) & (np.abs(z) <= vertex_z_max_mm)
 
     return bool(np.all(inside))

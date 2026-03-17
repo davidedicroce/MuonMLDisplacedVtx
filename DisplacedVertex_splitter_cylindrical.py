@@ -3,7 +3,7 @@
 Prepare and save a deterministic train/val split for the displaced vertex
 cylindrical-coordinate dataset.
 
-This matches the output of DisplacedVertex_cylindrical_converter.py.
+This matches the output of DisplacedVertex_converter_cylindrical.py.
 
 Expected node features:
         x[:, :] = [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
@@ -13,7 +13,7 @@ Expected target:
 
 Example
 -------
-python DisplacedVertex_cylindrical_splitter.py \
+python DisplacedVertex_splitter_cylindrical.py \
     --data-glob "./data_cylindrical/displaced_vertex_dataset_part*.h5" \
     --val-fraction 0.1 \
     --seed 12345 \
