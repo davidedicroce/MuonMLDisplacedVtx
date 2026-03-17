@@ -903,23 +903,34 @@ def build_regression_loss(name: str):
 
 
 @torch.no_grad()
-def regression_stats(pred: torch.Tensor, target: torch.Tensor):
+def regression_stats(pred: torch.Tensor, target: torch.Tensor, mape_eps: float = 1e-6):
     """
     pred, target: [3] = [rho, phi, z]
     """
     diff = pred - target
     abs_diff = diff.abs()
     sq_diff = diff.pow(2)
+    denom = target.abs().clamp(min=float(mape_eps))
+    ape = abs_diff / denom
+    mape_pct = 100.0 * ape
 
     mae = abs_diff.mean()
     rmse = torch.sqrt(sq_diff.mean())
+    mape = mape_pct.mean()
 
     mae_rho = abs_diff[0]
     mae_phi = abs_diff[1]
     mae_z = abs_diff[2]
 
-    return mae, rmse, mae_rho, mae_phi, mae_z
+    mape_rho = mape_pct[0]
+    mape_phi = mape_pct[1]
+    mape_z   = mape_pct[2]
 
+    return (
+        mae, rmse, mape,
+        mae_rho, mae_phi, mae_z,
+        mape_rho, mape_phi, mape_z,
+    )
 
 def build_scheduler(opt, args, steps_per_epoch: int):
     if args.lr_schedule == "plateau":
@@ -1422,9 +1433,13 @@ def main():
         train_steps = torch.tensor(0.0, device=device)
         train_mae = torch.tensor(0.0, device=device)
         train_rmse = torch.tensor(0.0, device=device)
+        train_mape = torch.tensor(0.0, device=device)
         train_mae_rho = torch.tensor(0.0, device=device)
         train_mae_phi = torch.tensor(0.0, device=device)
         train_mae_z = torch.tensor(0.0, device=device)
+        train_mape_rho = torch.tensor(0.0, device=device)
+        train_mape_phi = torch.tensor(0.0, device=device)
+        train_mape_z = torch.tensor(0.0, device=device)
 
         for batch in train_loader:
             x = batch["x"].to(device, non_blocking=True)
@@ -1462,7 +1477,9 @@ def main():
 
             with torch.no_grad():
                 pred_metric = pred_train * target_std + target_mean if args.normalize_target else pred_train
-                mae, rmse, mae_rho, mae_phi, mae_z = regression_stats(pred_metric, y)
+                (
+                    mae, rmse, mape, mae_rho, mae_phi, mae_z, mape_rho, mape_phi, mape_z
+                ) = regression_stats(pred_metric, y)
 
             train_loss += loss.detach()
             train_steps += 1.0
@@ -1471,21 +1488,33 @@ def main():
             train_mae_rho += mae_rho
             train_mae_phi += mae_phi
             train_mae_z += mae_z
+            train_mape += mape
+            train_mape_rho += mape_rho
+            train_mape_phi += mape_phi
+            train_mape_z += mape_z
 
         ddp_all_reduce_sum(train_loss)
         ddp_all_reduce_sum(train_steps)
         ddp_all_reduce_sum(train_mae)
         ddp_all_reduce_sum(train_rmse)
+        ddp_all_reduce_sum(train_mape)
         ddp_all_reduce_sum(train_mae_rho)
         ddp_all_reduce_sum(train_mae_phi)
         ddp_all_reduce_sum(train_mae_z)
+        ddp_all_reduce_sum(train_mape_rho)
+        ddp_all_reduce_sum(train_mape_phi)
+        ddp_all_reduce_sum(train_mape_z)
 
         train_loss_mean = (train_loss / torch.clamp(train_steps, min=1.0)).item()
         train_mae_mean = (train_mae / torch.clamp(train_steps, min=1.0)).item()
         train_rmse_mean = (train_rmse / torch.clamp(train_steps, min=1.0)).item()
+        train_mape_mean = (train_mape / torch.clamp(train_steps, min=1.0)).item()
         train_mae_rho_mean = (train_mae_rho / torch.clamp(train_steps, min=1.0)).item()
         train_mae_phi_mean = (train_mae_phi / torch.clamp(train_steps, min=1.0)).item()
         train_mae_z_mean = (train_mae_z / torch.clamp(train_steps, min=1.0)).item()
+        train_mape_rho_mean = (train_mape_rho / torch.clamp(train_steps, min=1.0)).item()
+        train_mape_phi_mean = (train_mape_phi / torch.clamp(train_steps, min=1.0)).item()
+        train_mape_z_mean = (train_mape_z / torch.clamp(train_steps, min=1.0)).item() 
 
         model.eval()
 
@@ -1493,9 +1522,13 @@ def main():
         val_steps = torch.tensor(0.0, device=device)
         val_mae = torch.tensor(0.0, device=device)
         val_rmse = torch.tensor(0.0, device=device)
+        val_mape = torch.tensor(0.0, device=device)
         val_mae_rho = torch.tensor(0.0, device=device)
         val_mae_phi = torch.tensor(0.0, device=device)
         val_mae_z = torch.tensor(0.0, device=device)
+        val_mape_rho = torch.tensor(0.0, device=device)
+        val_mape_phi = torch.tensor(0.0, device=device)
+        val_mape_z = torch.tensor(0.0, device=device)
 
         eval_ctx = ema.apply_to(model) if ema is not None else nullcontext()
         with eval_ctx:
@@ -1513,30 +1546,44 @@ def main():
                         loss = loss_fn(pred_eval, y_eval)
 
                     pred_metric = pred_eval * target_std + target_mean if args.normalize_target else pred_eval
-                    mae, rmse, mae_rho, mae_phi, mae_z = regression_stats(pred_metric, y)
+                    (
+                        mae, rmse, mape, mae_rho, mae_phi, mae_z, mape_rho, mape_phi, mape_z
+                    ) = regression_stats(pred_metric, y)
 
                     val_loss += loss
                     val_steps += 1.0
                     val_mae += mae
                     val_rmse += rmse
+                    val_mape += mape
                     val_mae_rho += mae_rho
                     val_mae_phi += mae_phi
                     val_mae_z += mae_z
+                    val_mape_rho += mape_rho
+                    val_mape_phi += mape_phi
+                    val_mape_z += mape_z
 
         ddp_all_reduce_sum(val_loss)
         ddp_all_reduce_sum(val_steps)
         ddp_all_reduce_sum(val_mae)
         ddp_all_reduce_sum(val_rmse)
+        ddp_all_reduce_sum(val_mape)
         ddp_all_reduce_sum(val_mae_rho)
         ddp_all_reduce_sum(val_mae_phi)
         ddp_all_reduce_sum(val_mae_z)
+        ddp_all_reduce_sum(val_mape_rho)
+        ddp_all_reduce_sum(val_mape_phi)
+        ddp_all_reduce_sum(val_mape_z)
 
         val_loss_mean = (val_loss / torch.clamp(val_steps, min=1.0)).item()
         val_mae_mean = (val_mae / torch.clamp(val_steps, min=1.0)).item()
         val_rmse_mean = (val_rmse / torch.clamp(val_steps, min=1.0)).item()
+        val_mape_mean = (val_mape / torch.clamp(val_steps, min=1.0)).item()
         val_mae_rho_mean = (val_mae_rho / torch.clamp(val_steps, min=1.0)).item()
         val_mae_phi_mean = (val_mae_phi / torch.clamp(val_steps, min=1.0)).item()
         val_mae_z_mean = (val_mae_z / torch.clamp(val_steps, min=1.0)).item()
+        val_mape_rho_mean = (val_mape_rho / torch.clamp(val_steps, min=1.0)).item()
+        val_mape_phi_mean = (val_mape_phi / torch.clamp(val_steps, min=1.0)).item()
+        val_mape_z_mean = (val_mape_z / torch.clamp(val_steps, min=1.0)).item()
 
         if args.lr_schedule == "plateau":
             scheduler.step(val_loss_mean)
@@ -1557,10 +1604,12 @@ def main():
         if ddp_is_main():
             print(
                 f"[epoch {epoch:03d}] "
-                f"train loss={train_loss_mean:.5f} mae={train_mae_mean:.5f} rmse={train_rmse_mean:.5f} "
-                f"(rho={train_mae_rho_mean:.5f}, phi={train_mae_phi_mean:.5f}, z={train_mae_z_mean:.5f}) | "
-                f"val loss={val_loss_mean:.5f} mae={val_mae_mean:.5f} rmse={val_rmse_mean:.5f} "
-                f"(rho={val_mae_rho_mean:.5f}, phi={val_mae_phi_mean:.5f}, z={val_mae_z_mean:.5f}) | "
+                f"train loss={train_loss_mean:.5f} mae={train_mae_mean:.5f} rmse={train_rmse_mean:.5f} mape={train_mape_mean:.5f}% "
+                f"(mae: rho={train_mae_rho_mean:.5f}, phi={train_mae_phi_mean:.5f}, z={train_mae_z_mean:.5f}; "
+                f"mape: rho={train_mape_rho_mean:.5f}%, phi={train_mape_phi_mean:.5f}%, z={train_mape_z_mean:.5f}%) | "
+                f"val loss={val_loss_mean:.5f} mae={val_mae_mean:.5f} rmse={val_rmse_mean:.5f} mape={val_mape_mean:.5f}% "
+                f"(mae: rho={val_mae_rho_mean:.5f}, phi={val_mae_phi_mean:.5f}, z={val_mae_z_mean:.5f}; "
+                f"mape: rho={val_mape_rho_mean:.5f}%, phi={val_mape_phi_mean:.5f}%, z={val_mape_z_mean:.5f}%) | "                
                 f"lr={current_lr:.3e} | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}",
                 flush=True,
@@ -1573,15 +1622,24 @@ def main():
                     "train/loss": train_loss_mean,
                     "train/mae": train_mae_mean,
                     "train/rmse": train_rmse_mean,
+                    "train/mape": train_mape_mean,
                     "train/mae_rho": train_mae_rho_mean,
                     "train/mae_phi": train_mae_phi_mean,
                     "train/mae_z": train_mae_z_mean,
+                    "train/mape_rho": train_mape_rho_mean,
+                    "train/mape_phi": train_mape_phi_mean,
+                    "train/mape_z": train_mape_z_mean,
+
                     "val/loss": val_loss_mean,
                     "val/mae": val_mae_mean,
                     "val/rmse": val_rmse_mean,
+                    "val/mape": val_mape_mean,
                     "val/mae_rho": val_mae_rho_mean,
                     "val/mae_phi": val_mae_phi_mean,
                     "val/mae_z": val_mae_z_mean,
+                    "val/mape_rho": val_mape_rho_mean,
+                    "val/mape_phi": val_mape_phi_mean,
+                    "val/mape_z": val_mape_z_mean,
                     "lr": current_lr,
                     args.early_stop_monitor: monitor_val,
                 },
