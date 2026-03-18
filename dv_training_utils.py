@@ -18,6 +18,7 @@ Contains:
 """
 
 import argparse
+import json
 import glob
 import os
 import random
@@ -46,6 +47,18 @@ from torch.utils.data.distributed import DistributedSampler
 
 import wandb
 
+
+# ============================================================
+# Feature-name conventions for optional input normalization
+# ============================================================
+
+NODE_FEATURE_NAMES = [
+    "r_pos", "theta_pos", "phi_pos", "theta_dir", "phi_dir", "energy_like", "nCells_or_DoF"
+]
+
+EDGE_FEATURE_NAMES = [
+    "d_energy_like", "d_phi", "d_eta", "cos_angle", "same_sector"
+]
 
 # ============================================================
 # Utility helpers
@@ -251,6 +264,136 @@ def ddp_barrier():
 
 
 # ============================================================
+# Optional feature-normalization helpers
+# ============================================================
+
+def _stats_dict_to_arrays(stats_dict: Dict[str, Any], feature_names: List[str], *, kind: str):
+    """
+    Convert a dict keyed by feature name into dense center/scale arrays.
+
+    Supported formats per feature:
+      standard: {"mean": ..., "std": ...}
+      robust:   {"median": ..., "iqr": ...}
+    """
+    center = []
+    scale = []
+
+    if kind == "standard":
+        ckey, skey = "mean", "std"
+    elif kind == "robust":
+        ckey, skey = "median", "iqr"
+    else:
+        raise ValueError(f"Unsupported normalization kind: {kind}")
+
+    for name in feature_names:
+        if name not in stats_dict:
+            raise KeyError(f"Missing feature {name!r} in stats file.")
+        row = stats_dict[name]
+        if ckey not in row or skey not in row:
+            raise KeyError(
+                f"Feature {name!r} missing required keys {ckey!r}/{skey!r} for kind={kind!r}."
+            )
+        center.append(float(row[ckey]))
+        scale.append(max(float(row[skey]), 1e-12))
+
+    return (
+        np.asarray(center, dtype=np.float32),
+        np.asarray(scale, dtype=np.float32),
+    )
+    
+def _pick_first_present(payload: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    for k in candidates:
+        if k in payload:
+            return k
+    return None
+
+
+def load_feature_stats_json(stats_path: str, norm_kind: str = "standard") -> Dict[str, np.ndarray]:
+    """
+    Load feature-normalization stats from JSON.
+
+    Expected JSON layout:
+      {
+        "mu_standard": {
+          "r_pos": {"mean": ..., "std": ...},
+          ...
+        },
+        "ca_standard": {
+          ...
+        },
+        "edge_standard" or "ed_standard": {
+          ...
+        },
+        "mu_robust": {
+          "r_pos": {"median": ..., "iqr": ...},
+          ...
+        },
+        "ca_robust": { ... },
+        "edge_robust" or "ed_robust": { ... }
+      }
+
+    Returns arrays suitable for direct numpy/torch broadcasting.
+    """
+    with open(stats_path, "r") as f:
+        payload = json.load(f)
+
+    if norm_kind == "standard":
+        mu_key = "mu_standard"
+        ca_key = "ca_standard"
+        edge_key = _pick_first_present(payload, ["edge_standard", "ed_standard"])
+    elif norm_kind == "robust":
+        mu_key = "mu_robust"
+        ca_key = "ca_robust"
+        edge_key = _pick_first_present(payload, ["edge_robust", "ed_robust"])
+    else:
+        raise ValueError(f"Unsupported norm_kind={norm_kind!r}")
+
+    if mu_key not in payload:
+        raise KeyError(f"Stats file missing top-level key {mu_key!r}")
+    if ca_key not in payload:
+        raise KeyError(f"Stats file missing top-level key {ca_key!r}")
+
+    mu_center, mu_scale = _stats_dict_to_arrays(payload[mu_key], NODE_FEATURE_NAMES, kind=norm_kind)
+    ca_center, ca_scale = _stats_dict_to_arrays(payload[ca_key], NODE_FEATURE_NAMES, kind=norm_kind)
+
+    out = {
+        "mu_center": mu_center,
+        "mu_scale": mu_scale,
+        "ca_center": ca_center,
+        "ca_scale": ca_scale,
+        "meta": {
+            "mu_key": mu_key,
+            "ca_key": ca_key,
+            "edge_key": edge_key,
+            "norm_kind": norm_kind,
+            "stats_path": stats_path,
+            "has_edge_stats": edge_key is not None,
+        },
+    }
+    if edge_key is not None:
+        edge_center, edge_scale = _stats_dict_to_arrays(payload[edge_key], EDGE_FEATURE_NAMES, kind=norm_kind)
+        out["edge_center"] = edge_center
+        out["edge_scale"] = edge_scale
+
+    return out
+
+
+def _apply_feature_norm_np(arr: np.ndarray, center: np.ndarray, scale: np.ndarray, clip: float = -1.0) -> np.ndarray:
+    out = (arr - center) / scale
+    if clip is not None and clip > 0:
+        out = np.clip(out, -clip, clip)
+    return out.astype(np.float32, copy=False)
+
+
+def _require_feature_stats(feature_stats, what: str):
+    if feature_stats is None:
+        raise RuntimeError(
+            f"{what} normalization was requested but no feature stats were loaded. "
+            f"Pass --feature-stats-json <path>."
+        )
+
+
+# ============================================================
 # Dataset
 # ============================================================
 
@@ -262,8 +405,26 @@ class H5EventDataset(Dataset):
       /events/<id>/x, edge_index, edge_attr, y_vertex
     """
 
-    def __init__(self, h5_paths):
+    def __init__(
+        self,
+        h5_paths,
+        *,
+        normalize_node_features: bool = False,
+        normalize_edge_features: bool = False,
+        feature_stats: Optional[Dict[str, np.ndarray]] = None,
+        feature_norm_clip: float = -1.0,
+    ):
         self.h5_paths = list(h5_paths)
+        self.normalize_node_features = bool(normalize_node_features)
+        self.normalize_edge_features = bool(normalize_edge_features)
+        self.feature_stats = feature_stats
+        self.feature_norm_clip = float(feature_norm_clip)
+
+        if self.normalize_node_features:
+            _require_feature_stats(self.feature_stats, "Node-feature")
+        if self.normalize_edge_features:
+            _require_feature_stats(self.feature_stats, "Edge-feature")
+        
         if not self.h5_paths:
             raise ValueError("No H5 files provided.")
 
@@ -322,6 +483,39 @@ class H5EventDataset(Dataset):
             )
 
         y_vertex = torch.from_numpy(g["y_vertex"][...]).float()
+       
+        if self.normalize_node_features:
+            if "n_muon_nodes" not in g.attrs:
+                raise RuntimeError(
+                    f"Missing attribute 'n_muon_nodes' in {self.h5_paths[fi]} /events/{k}; "
+                    "cannot split muon/calo nodes for feature normalization."
+                )
+            n_mu = int(g.attrs["n_muon_nodes"])
+            x_np = x.numpy()
+            if n_mu > 0:
+                x_np[:n_mu] = _apply_feature_norm_np(
+                    x_np[:n_mu],
+                    self.feature_stats["mu_center"],
+                    self.feature_stats["mu_scale"],
+                    clip=self.feature_norm_clip,
+                )
+            if n_mu < x_np.shape[0]:
+                x_np[n_mu:] = _apply_feature_norm_np(
+                    x_np[n_mu:],
+                    self.feature_stats["ca_center"],
+                    self.feature_stats["ca_scale"],
+                    clip=self.feature_norm_clip,
+                )
+
+        if self.normalize_edge_features:
+            edge_attr_np = edge_attr.numpy()
+            edge_attr_np[:] = _apply_feature_norm_np(
+                edge_attr_np,
+                self.feature_stats["edge_center"],
+                self.feature_stats["edge_scale"],
+                clip=self.feature_norm_clip,
+            )
+
 
         return {
             "x": x,
@@ -976,6 +1170,18 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--normalize-target", action="store_true", default=True,
                     help="Train on normalized y_vertex and unnormalize for metrics.")
     ap.add_argument("--no-normalize-target", dest="normalize_target", action="store_false")
+    ap.add_argument("--feature-stats-json", default=None,
+                    help="JSON file with precomputed node/edge feature normalization stats.")
+    ap.add_argument("--feature-norm-kind", default="standard", choices=["standard", "robust"],
+                    help="Which stats block to use from --feature-stats-json.")
+    ap.add_argument("--normalize-node-features", action="store_true", default=False,
+                    help="Apply precomputed normalization to node features x.")
+    ap.add_argument("--no-normalize-node-features", dest="normalize_node_features", action="store_false")
+    ap.add_argument("--normalize-edge-features", action="store_true", default=False,
+                    help="Apply precomputed normalization to edge_attr.")
+    ap.add_argument("--no-normalize-edge-features", dest="normalize_edge_features", action="store_false")
+    ap.add_argument("--feature-norm-clip", type=float, default=-1.0,
+                    help="Optional absolute clip after feature normalization. <=0 disables clipping.")
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
 
     ap.add_argument("--max-train-events", type=int, default=-1)
@@ -1119,8 +1325,45 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
     if not paths:
         raise SystemExit(f"No H5 files matched: {args.data_glob}")
 
+    feature_stats = None
+    if args.normalize_node_features or args.normalize_edge_features:
+        if args.feature_stats_json is None:
+            raise SystemExit(
+                "Feature normalization was requested but --feature-stats-json was not provided."
+            )
+        feature_stats = load_feature_stats_json(
+            args.feature_stats_json,
+            norm_kind=args.feature_norm_kind,
+        )
+        
+        if args.normalize_edge_features and not feature_stats["meta"]["has_edge_stats"]:
+            raise SystemExit(
+                "Edge normalization was requested but the stats JSON does not contain edge stats.\n"
+                "Expected one of: 'edge_standard'/'ed_standard' or 'edge_robust'/'ed_robust'.\n"
+                "Either regenerate the stats file with edge features included, or disable "
+                "--normalize-edge-features."
+            )
+
+        if ddp_is_main():
+            print(
+                f"[i] loaded feature stats from {args.feature_stats_json} "
+                f"(kind={args.feature_norm_kind}, "
+                f"normalize_node_features={args.normalize_node_features}, "
+                f"normalize_edge_features={args.normalize_edge_features}, "
+                f"clip={args.feature_norm_clip}, "
+                f"mu_key={feature_stats['meta']['mu_key']}, "
+                f"ca_key={feature_stats['meta']['ca_key']}, edge_key={feature_stats['meta']['edge_key']})",
+                flush=True,
+            )
+
     with timed_section("dataset_index", device=device, enabled=args.time) as tt:
-        ds = H5EventDataset(paths)
+        ds = H5EventDataset(
+            paths,
+            normalize_node_features=args.normalize_node_features,
+            normalize_edge_features=args.normalize_edge_features,
+            feature_stats=feature_stats,
+            feature_norm_clip=args.feature_norm_clip,
+        )
     if ddp_is_main() and args.time:
         print(f"[time] dataset indexing: {tt['seconds']:.3f}s", flush=True)
 
@@ -1278,6 +1521,10 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             "normalize_target": args.normalize_target,
             "target_mean": target_mean.detach().cpu().tolist(),
             "target_std": target_std.detach().cpu().tolist(),
+            "normalize_node_features": args.normalize_node_features,
+            "normalize_edge_features": args.normalize_edge_features,
+            "feature_stats_json": args.feature_stats_json,
+            "feature_norm_kind": args.feature_norm_kind,
             "coordinate_system": coordinate_system,
             "target_labels": target_labels,
         }
@@ -1583,6 +1830,10 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     "normalize_target": args.normalize_target,
                     "target_mean": target_mean.detach().cpu(),
                     "target_std": target_std.detach().cpu(),
+                    "normalize_node_features": args.normalize_node_features,
+                    "normalize_edge_features": args.normalize_edge_features,
+                    "feature_stats_json": args.feature_stats_json,
+                    "feature_norm_kind": args.feature_norm_kind,
                     "best_monitor": best_monitor,
                     "early_stop_monitor": args.early_stop_monitor,
                     "best_ckpt_epoch": best_ckpt_epoch,
