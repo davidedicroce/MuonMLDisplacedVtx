@@ -1025,6 +1025,62 @@ def estimate_target_stats(train_ds, device, max_events: int = -1):
 
     return mean, std
 
+@torch.no_grad()
+def estimate_target_transform(train_ds, device, mode: str = "none", max_events: int = -1, eps: float = 1e-6):
+    mode = str(mode).lower()
+    eps = float(eps)
+
+    if ddp_is_main():
+        loader = DataLoader(
+            train_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=collate_one,
+        )
+
+        ys = []
+        for i, batch in enumerate(loader):
+            if max_events > 0 and i >= max_events:
+                break
+            ys.append(batch["y_vertex"].float().view(1, 3))
+
+        if len(ys) == 0:
+            center = torch.zeros(3, dtype=torch.float32, device=device)
+            scale = torch.ones(3, dtype=torch.float32, device=device)
+        else:
+            y = torch.cat(ys, dim=0).to(device)
+
+            if mode == "none":
+                center = torch.zeros(3, dtype=torch.float32, device=device)
+                scale = torch.ones(3, dtype=torch.float32, device=device)
+            elif mode == "standard":
+                center = y.mean(dim=0)
+                scale = y.std(dim=0, unbiased=False).clamp(min=eps)
+            elif mode == "robust":
+                q25 = torch.quantile(y, 0.25, dim=0)
+                q50 = torch.quantile(y, 0.50, dim=0)
+                q75 = torch.quantile(y, 0.75, dim=0)
+                center = q50
+                scale = (q75 - q25).clamp(min=eps)
+            elif mode == "minmax":
+                ymin = y.min(dim=0).values
+                ymax = y.max(dim=0).values
+                center = ymin
+                scale = (ymax - ymin).clamp(min=eps)
+            else:
+                raise ValueError(f"Unknown target scaling mode: {mode}")
+    else:
+        center = torch.zeros(3, dtype=torch.float32, device=device)
+        scale = torch.ones(3, dtype=torch.float32, device=device)
+
+    if ddp_is_initialized():
+        dist.broadcast(center, src=0)
+        dist.broadcast(scale, src=0)
+
+    return center, scale
+
 
 def build_regression_loss(name: str):
     name = name.lower()
@@ -1183,7 +1239,10 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--feature-norm-clip", type=float, default=-1.0,
                     help="Optional absolute clip after feature normalization. <=0 disables clipping.")
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
-
+    
+    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="none",
+                    help=("Scale regression targets before loss computation. Use 'robust' if target components have very different ranges or outliers."),)
+    ap.add_argument("--target-scale-eps", type=float, default=1e-6, help="Numerical epsilon for target scaling.")
     ap.add_argument("--max-train-events", type=int, default=-1)
 
     ap.add_argument("--save", default="displaced_vertex_gnn.pt")
@@ -1482,18 +1541,42 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
 
     loss_fn = build_regression_loss(args.loss)
 
-    if args.normalize_target:
-        target_mean, target_std = estimate_target_stats(
-            train_ds, device=device, max_events=args.target_stats_max_events,
-        )
+    # ----------------------------------------------------------
+    # Target transform used for loss-space training
+    #
+    # Backward compatibility:
+    #   - if --target-scale=none:
+    #       * --normalize-target  => standard scaling (mean/std)
+    #       * --no-normalize-target => identity
+    #   - if --target-scale is explicitly set to standard/robust/minmax,
+    #       it takes precedence over --normalize-target.
+    # ----------------------------------------------------------
+    if args.target_scale != "none":
+        effective_target_scale = args.target_scale
     else:
-        target_mean = torch.zeros(3, dtype=torch.float32, device=device)
-        target_std = torch.ones(3, dtype=torch.float32, device=device)
+        effective_target_scale = "standard" if args.normalize_target else "none"
+
+    target_center, target_scale = estimate_target_transform(
+        train_ds,
+        device=device,
+        mode=effective_target_scale,
+        max_events=args.target_stats_max_events,
+        eps=args.target_scale_eps,
+    )
+
+    # legacy aliases kept so existing codepaths/checkpoints remain readable
+    target_mean = target_center
+    target_std = target_scale
 
     if ddp_is_main():
         labels_str = ", ".join(target_labels)
-        print(f"[i] target_mean={target_mean.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
-        print(f"[i] target_std ={target_std.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
+        print(f"[i] target_scale_mode={effective_target_scale}", flush=True)
+        print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
+        print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
+        if args.target_scale == "none" and args.normalize_target:
+            print("[i] note: using legacy standard target normalization because --normalize-target is enabled.", flush=True)
+        elif args.target_scale != "none":
+            print(f"[i] note: --target-scale={args.target_scale} overrides --normalize-target/--no-normalize-target for loss-space scaling.", flush=True)
 
     steps_per_epoch = len(train_loader)
     scheduler = build_scheduler(opt, args, steps_per_epoch=steps_per_epoch)
@@ -1521,6 +1604,10 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             "normalize_target": args.normalize_target,
             "target_mean": target_mean.detach().cpu().tolist(),
             "target_std": target_std.detach().cpu().tolist(),
+            "target_scale_mode": effective_target_scale,
+            "target_center": target_center.detach().cpu().tolist(),
+            "target_scale": target_scale.detach().cpu().tolist(),
+            "target_scale_eps": args.target_scale_eps,
             "normalize_node_features": args.normalize_node_features,
             "normalize_edge_features": args.normalize_edge_features,
             "feature_stats_json": args.feature_stats_json,
@@ -1607,7 +1694,7 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             edge_attr = batch["edge_attr"].to(device, non_blocking=True)
             y = batch["y_vertex"].to(device, non_blocking=True).float()
 
-            y_train = (y - target_mean) / target_std if args.normalize_target else y
+            y_train = (y - target_center) / target_scale
 
             if args.feat_noise_std > 0.0 and model.training:
                 x = x + args.feat_noise_std * torch.randn_like(x)
@@ -1636,7 +1723,7 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                 scheduler.step()
 
             with torch.no_grad():
-                pred_metric = pred_train * target_std + target_mean if args.normalize_target else pred_train
+                pred_metric = pred_train * target_scale + target_center
                 mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
                     pred_metric, y, args.mape_eps
                 )
@@ -1697,13 +1784,13 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     edge_attr = batch["edge_attr"].to(device, non_blocking=True)
                     y = batch["y_vertex"].to(device, non_blocking=True).float()
 
-                    y_eval = (y - target_mean) / target_std if args.normalize_target else y
+                    y_eval = (y - target_center) / target_scale
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                         pred_eval = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
                         loss = loss_fn(pred_eval, y_eval)
 
-                    pred_metric = pred_eval * target_std + target_mean if args.normalize_target else pred_eval
+                    pred_metric = pred_eval * target_scale + target_center
                     mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
                         pred_metric, y, args.mape_eps
                     )
@@ -1830,6 +1917,10 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     "normalize_target": args.normalize_target,
                     "target_mean": target_mean.detach().cpu(),
                     "target_std": target_std.detach().cpu(),
+                    "target_scale_mode": effective_target_scale,
+                    "target_center": target_center.detach().cpu(),
+                    "target_scale": target_scale.detach().cpu(),
+                    "target_scale_eps": args.target_scale_eps,
                     "normalize_node_features": args.normalize_node_features,
                     "normalize_edge_features": args.normalize_edge_features,
                     "feature_stats_json": args.feature_stats_json,
