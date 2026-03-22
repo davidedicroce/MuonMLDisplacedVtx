@@ -19,6 +19,7 @@ Contains:
 
 import argparse
 import json
+import math
 import glob
 import os
 import random
@@ -1082,19 +1083,27 @@ def estimate_target_transform(train_ds, device, mode: str = "none", max_events: 
     return center, scale
 
 
-def build_regression_loss(name: str):
-    name = name.lower()
-    if name == "smoothl1":
-        return nn.SmoothL1Loss(reduction="mean")
-    if name == "mse":
-        return nn.MSELoss(reduction="mean")
-    if name == "l1":
-        return nn.L1Loss(reduction="mean")
-    raise ValueError(f"Unknown loss: {name}")
+def wrapped_angle_diff(
+    pred_phi: torch.Tensor,
+    target_phi: torch.Tensor,
+    period: float = 2.0 * math.pi,
+) -> torch.Tensor:
+    half_period = 0.5 * float(period)
+    return (
+        torch.remainder(pred_phi - target_phi + half_period, float(period)) - half_period
+    )
 
 
 @torch.no_grad()
-def regression_stats(pred: torch.Tensor, target: torch.Tensor, mape_eps: float = 1e-6) -> Tuple:
+def regression_stats(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mape_eps: float = 1e-6,
+    *,
+    periodic_phi_loss: bool = False,
+    phi_index: int = 1,
+    phi_period: float = 2.0 * math.pi,
+) -> Tuple:
     """
     Compute regression statistics for a 3-component prediction.
 
@@ -1103,6 +1112,11 @@ def regression_stats(pred: torch.Tensor, target: torch.Tensor, mape_eps: float =
          coord0_mape_pct, coord1_mape_pct, coord2_mape_pct)
     """
     diff = pred - target
+    if periodic_phi_loss:
+        diff = diff.clone()
+        diff[phi_index] = wrapped_angle_diff(
+            pred[phi_index], target[phi_index], period=phi_period
+        )
     abs_diff = diff.abs()
     sq_diff = diff.pow(2)
     denom = target.abs().clamp(min=float(mape_eps))
@@ -1121,6 +1135,32 @@ def regression_stats(pred: torch.Tensor, target: torch.Tensor, mape_eps: float =
         100.0 * ape[1],
         100.0 * ape[2],
     )
+
+
+def regression_loss_with_optional_periodic_phi(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    loss_name: str,
+    periodic_phi_loss: bool = False,
+    phi_index: int = 1,
+    phi_period: float = 2.0 * math.pi,
+) -> torch.Tensor:
+    diff = pred - target
+    if periodic_phi_loss:
+        diff = diff.clone()
+        diff[phi_index] = wrapped_angle_diff(
+            pred[phi_index], target[phi_index], period=phi_period
+        )
+
+    loss_name = loss_name.lower()
+    if loss_name == "mse":
+        return diff.pow(2).mean()
+    if loss_name == "l1":
+        return diff.abs().mean()
+    if loss_name == "smoothl1":
+        return F.smooth_l1_loss(diff, torch.zeros_like(diff), reduction="mean")
+    raise ValueError(f"Unknown loss: {loss_name}")
 
 
 def build_scheduler(opt, args, steps_per_epoch: int):
@@ -1308,6 +1348,14 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--mape-eps", type=float, default=1e-6,
                     help="Minimum |target| in MAPE denominator to avoid division by zero.")
 
+    ap.add_argument("--periodic-phi-loss", action="store_true", default=False,
+                    help="Use shortest wrapped angular difference for the phi target in loss and metrics.")
+    ap.add_argument("--no-periodic-phi-loss", dest="periodic_phi_loss", action="store_false")
+    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi),
+                    help="Period used for wrapped phi differences in metric space. Default is 2*pi.")
+    ap.add_argument("--phi-index", type=int, default=1,
+                    help="Index of the angular phi target within y. For cylindrical targets [rho, phi, z], use 1.")
+     
     ap.add_argument("--ema", action="store_true", default=True)
     ap.add_argument("--no-ema", dest="ema", action="store_false")
     ap.add_argument("--ema-decay", type=float, default=0.999)
@@ -1539,8 +1587,6 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
     except TypeError:
         opt = torch.optim.AdamW(param_groups, lr=args.lr)
 
-    loss_fn = build_regression_loss(args.loss)
-
     # ----------------------------------------------------------
     # Target transform used for loss-space training
     #
@@ -1573,17 +1619,27 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
         print(f"[i] target_scale_mode={effective_target_scale}", flush=True)
         print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
         print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
+        print(
+            f"[i] periodic_phi_loss={args.periodic_phi_loss} "
+            f"phi_index={args.phi_index} phi_period={args.phi_period}",
+            flush=True,
+        )
         if args.target_scale == "none" and args.normalize_target:
             print("[i] note: using legacy standard target normalization because --normalize-target is enabled.", flush=True)
         elif args.target_scale != "none":
             print(f"[i] note: --target-scale={args.target_scale} overrides --normalize-target/--no-normalize-target for loss-space scaling.", flush=True)
+            
+    if not (0 <= int(args.phi_index) < len(target_labels)):
+        raise ValueError(
+            f"--phi-index={args.phi_index} is out of range for target_labels={target_labels}"
+        )
 
     steps_per_epoch = len(train_loader)
     scheduler = build_scheduler(opt, args, steps_per_epoch=steps_per_epoch)
 
     use_amp = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     ema = EMA.create(model, decay=args.ema_decay) if args.ema else None
 
@@ -1614,6 +1670,9 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             "feature_norm_kind": args.feature_norm_kind,
             "coordinate_system": coordinate_system,
             "target_labels": target_labels,
+            "periodic_phi_loss": args.periodic_phi_loss,
+            "phi_period": args.phi_period,
+            "phi_index": args.phi_index,
         }
 
         try:
@@ -1693,6 +1752,11 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             edge_index = batch["edge_index"].to(device, non_blocking=True)
             edge_attr = batch["edge_attr"].to(device, non_blocking=True)
             y = batch["y_vertex"].to(device, non_blocking=True).float()
+            
+            if args.periodic_phi_loss:
+                phi_period_loss_space = args.phi_period / float(target_scale[int(args.phi_index)].item())
+            else:
+                phi_period_loss_space = args.phi_period
 
             y_train = (y - target_center) / target_scale
 
@@ -1703,7 +1767,14 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 pred_train = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                loss = loss_fn(pred_train, y_train)
+                loss = regression_loss_with_optional_periodic_phi(
+                    pred_train,
+                    y_train,
+                    loss_name=args.loss,
+                    periodic_phi_loss=args.periodic_phi_loss,
+                    phi_index=int(args.phi_index),
+                    phi_period=phi_period_loss_space,
+                )
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -1725,7 +1796,10 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             with torch.no_grad():
                 pred_metric = pred_train * target_scale + target_center
                 mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
-                    pred_metric, y, args.mape_eps
+                    pred_metric, y, args.mape_eps,
+                    periodic_phi_loss=args.periodic_phi_loss,
+                    phi_index=int(args.phi_index),
+                    phi_period=args.phi_period,
                 )
 
             train_loss += loss.detach()
@@ -1783,19 +1857,34 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     edge_index = batch["edge_index"].to(device, non_blocking=True)
                     edge_attr = batch["edge_attr"].to(device, non_blocking=True)
                     y = batch["y_vertex"].to(device, non_blocking=True).float()
+                    
+                    if args.periodic_phi_loss:
+                        phi_period_loss_space = args.phi_period / float(target_scale[int(args.phi_index)].item())
+                    else:
+                        phi_period_loss_space = args.phi_period
 
                     y_eval = (y - target_center) / target_scale
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                         pred_eval = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss = loss_fn(pred_eval, y_eval)
+                        loss = regression_loss_with_optional_periodic_phi(
+                            pred_eval,
+                            y_eval,
+                            loss_name=args.loss,
+                            periodic_phi_loss=args.periodic_phi_loss,
+                            phi_index=int(args.phi_index),
+                            phi_period=phi_period_loss_space,
+                        )
 
                     pred_metric = pred_eval * target_scale + target_center
                     mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
-                        pred_metric, y, args.mape_eps
+                        pred_metric, y, args.mape_eps,
+                        periodic_phi_loss=args.periodic_phi_loss,
+                        phi_index=int(args.phi_index),
+                        phi_period=args.phi_period,
                     )
 
-                    val_loss += loss
+                    val_loss += loss.detach()
                     val_steps += 1.0
                     val_mae += mae
                     val_rmse += rmse
@@ -1921,6 +2010,9 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     "target_center": target_center.detach().cpu(),
                     "target_scale": target_scale.detach().cpu(),
                     "target_scale_eps": args.target_scale_eps,
+                    "periodic_phi_loss": args.periodic_phi_loss,
+                    "phi_period": args.phi_period,
+                    "phi_index": int(args.phi_index),
                     "normalize_node_features": args.normalize_node_features,
                     "normalize_edge_features": args.normalize_edge_features,
                     "feature_stats_json": args.feature_stats_json,
@@ -2000,7 +2092,7 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             if ema is not None:
                 ema = EMA.create(model, decay=args.ema_decay)
             if scaler.is_enabled():
-                scaler = torch.cuda.amp.GradScaler(enabled=True)
+                scaler = torch.amp.GradScaler("cuda", enabled=True)
             if args.early_stop:
                 bad_epochs = 0
             ddp_barrier()

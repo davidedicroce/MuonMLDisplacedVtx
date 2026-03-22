@@ -29,6 +29,7 @@ torchrun --standalone --nproc_per_node=1 train_DisplacedVertex_position_cylindri
     --weight-decay 0.02 \
     --edge-dropout 0.1 \
     --feat-noise-std 0.01 \
+    --periodic-phi-loss \
     --ema \
     --ema-decay 0.999 \
     --save-dir "models" \
@@ -63,6 +64,7 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex_position_cylindri
     --weight-decay 0.02 \\
     --edge-dropout 0.1 \\
     --feat-noise-std 0.01 \\ 
+    --periodic-phi-loss \\
     --ema \\
     --ema-decay 0.999 \\
     --save-dir "models" \\
