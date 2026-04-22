@@ -26,3 +26,6 @@ wandb/
 *.yaml
 *.zip
 *.tar.gz
+*save
+*new
+*old

@@ -2,19 +2,13 @@
 """
 dv_training_utils.py
 
-Shared utilities for DisplacedVertex training scripts:
-  train_DisplacedVertex_position.py
-  train_DisplacedVertex_position_cylindrical.py
-  train_DisplacedVertex_position_polar.py
+Shared utilities for DisplacedVertex training scripts.
 
-Contains:
-  - Utility and DDP helpers
-  - H5EventDataset (unified)
-  - EMA
-  - All GNN model building blocks and DisplacedVertexGNN
-  - Training utility functions
-  - Shared argparse setup
-  - run_training(): the full training loop parameterised by coordinate system
+v2 changes:
+  - Explicit per-target losses instead of a blind mean over all outputs
+  - Per-target loss weights via --target-loss-weights
+  - phi default can be trained as sin/cos via --phi-mode sincos
+  - SMAPE is logged for all targets
 """
 
 import argparse
@@ -49,10 +43,6 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 
 
-# ============================================================
-# Feature-name conventions for optional input normalization
-# ============================================================
-
 NODE_FEATURE_NAMES = [
     "r_pos", "theta_pos", "phi_pos", "theta_dir", "phi_dir", "energy_like", "nCells_or_DoF"
 ]
@@ -61,9 +51,6 @@ EDGE_FEATURE_NAMES = [
     "d_energy_like", "d_phi", "d_eta", "cos_angle", "same_sector"
 ]
 
-# ============================================================
-# Utility helpers
-# ============================================================
 
 def _ensure_parent_dir(path: str) -> None:
     try:
@@ -122,7 +109,6 @@ def _build_save_path(args, run_id: str) -> str:
 
 
 def _normalize_path_str(p: str) -> str:
-    """Normalize a path for robust comparisons across different launch directories."""
     try:
         return str(Path(p).expanduser().resolve())
     except Exception:
@@ -130,14 +116,6 @@ def _normalize_path_str(p: str) -> str:
 
 
 def _check_split_paths_compatible(split_npz, current_paths, *, strict: bool = False):
-    """
-    Validate that the split file was produced from the same H5 parts.
-    Compatibility policy:
-      1) exact normalized absolute paths match -> OK
-      2) same ordered basenames match          -> OK with warning
-      3) same basename multiset matches        -> OK with warning
-      4) otherwise                             -> raise (or warn if not strict)
-    """
     if "h5_paths" not in split_npz.files:
         return
 
@@ -206,10 +184,6 @@ def seed_all(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-# ============================================================
-# DDP helpers
-# ============================================================
-
 def ddp_is_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -264,18 +238,7 @@ def ddp_barrier():
         dist.barrier()
 
 
-# ============================================================
-# Optional feature-normalization helpers
-# ============================================================
-
 def _stats_dict_to_arrays(stats_dict: Dict[str, Any], feature_names: List[str], *, kind: str):
-    """
-    Convert a dict keyed by feature name into dense center/scale arrays.
-
-    Supported formats per feature:
-      standard: {"mean": ..., "std": ...}
-      robust:   {"median": ..., "iqr": ...}
-    """
     center = []
     scale = []
 
@@ -301,7 +264,8 @@ def _stats_dict_to_arrays(stats_dict: Dict[str, Any], feature_names: List[str], 
         np.asarray(center, dtype=np.float32),
         np.asarray(scale, dtype=np.float32),
     )
-    
+
+
 def _pick_first_present(payload: Dict[str, Any], candidates: List[str]) -> Optional[str]:
     for k in candidates:
         if k in payload:
@@ -310,31 +274,6 @@ def _pick_first_present(payload: Dict[str, Any], candidates: List[str]) -> Optio
 
 
 def load_feature_stats_json(stats_path: str, norm_kind: str = "standard") -> Dict[str, np.ndarray]:
-    """
-    Load feature-normalization stats from JSON.
-
-    Expected JSON layout:
-      {
-        "mu_standard": {
-          "r_pos": {"mean": ..., "std": ...},
-          ...
-        },
-        "ca_standard": {
-          ...
-        },
-        "edge_standard" or "ed_standard": {
-          ...
-        },
-        "mu_robust": {
-          "r_pos": {"median": ..., "iqr": ...},
-          ...
-        },
-        "ca_robust": { ... },
-        "edge_robust" or "ed_robust": { ... }
-      }
-
-    Returns arrays suitable for direct numpy/torch broadcasting.
-    """
     with open(stats_path, "r") as f:
         payload = json.load(f)
 
@@ -394,18 +333,7 @@ def _require_feature_stats(feature_stats, what: str):
         )
 
 
-# ============================================================
-# Dataset
-# ============================================================
-
 class H5EventDataset(Dataset):
-    """
-    Loads events from multiple H5 part files.
-
-    Expected structure:
-      /events/<id>/x, edge_index, edge_attr, y_vertex
-    """
-
     def __init__(
         self,
         h5_paths,
@@ -425,7 +353,7 @@ class H5EventDataset(Dataset):
             _require_feature_stats(self.feature_stats, "Node-feature")
         if self.normalize_edge_features:
             _require_feature_stats(self.feature_stats, "Edge-feature")
-        
+
         if not self.h5_paths:
             raise ValueError("No H5 files provided.")
 
@@ -479,12 +407,10 @@ class H5EventDataset(Dataset):
         edge_attr = torch.from_numpy(g["edge_attr"][...]).float()
 
         if "y_vertex" not in g:
-            raise RuntimeError(
-                f"Missing 'y_vertex' in {self.h5_paths[fi]} /events/{k}"
-            )
+            raise RuntimeError(f"Missing 'y_vertex' in {self.h5_paths[fi]} /events/{k}")
 
         y_vertex = torch.from_numpy(g["y_vertex"][...]).float()
-       
+
         if self.normalize_node_features:
             if "n_muon_nodes" not in g.attrs:
                 raise RuntimeError(
@@ -495,28 +421,21 @@ class H5EventDataset(Dataset):
             x_np = x.numpy()
             if n_mu > 0:
                 x_np[:n_mu] = _apply_feature_norm_np(
-                    x_np[:n_mu],
-                    self.feature_stats["mu_center"],
-                    self.feature_stats["mu_scale"],
+                    x_np[:n_mu], self.feature_stats["mu_center"], self.feature_stats["mu_scale"],
                     clip=self.feature_norm_clip,
                 )
             if n_mu < x_np.shape[0]:
                 x_np[n_mu:] = _apply_feature_norm_np(
-                    x_np[n_mu:],
-                    self.feature_stats["ca_center"],
-                    self.feature_stats["ca_scale"],
+                    x_np[n_mu:], self.feature_stats["ca_center"], self.feature_stats["ca_scale"],
                     clip=self.feature_norm_clip,
                 )
 
         if self.normalize_edge_features:
             edge_attr_np = edge_attr.numpy()
             edge_attr_np[:] = _apply_feature_norm_np(
-                edge_attr_np,
-                self.feature_stats["edge_center"],
-                self.feature_stats["edge_scale"],
+                edge_attr_np, self.feature_stats["edge_center"], self.feature_stats["edge_scale"],
                 clip=self.feature_norm_clip,
             )
-
 
         return {
             "x": x,
@@ -530,10 +449,6 @@ def collate_one(batch):
     assert len(batch) == 1
     return batch[0]
 
-
-# ============================================================
-# EMA
-# ============================================================
 
 @dataclass
 class EMA:
@@ -575,10 +490,6 @@ class EMA:
                     if k in backup:
                         v.copy_(backup[k])
 
-
-# ============================================================
-# Model building blocks
-# ============================================================
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=128, n_layers=2, dropout=0.0):
@@ -891,7 +802,6 @@ class EdgeMPNNLayer(nn.Module):
 
 
 def global_pool(h: torch.Tensor, mode: str = "meanmax") -> torch.Tensor:
-    """Pool node embeddings of a single graph into one graph embedding. h: [N, H] -> [1, P]"""
     if h.ndim != 2:
         raise ValueError(f"Expected h to have shape [N, H], got {tuple(h.shape)}")
 
@@ -926,11 +836,15 @@ class DisplacedVertexGNN(nn.Module):
         fourier_base=3.0,
         fourier_min_exp=-6,
         fourier_max_exp=6,
+        phi_mode: str = "sincos",
+        phi_index: int = 1,
     ):
         super().__init__()
 
         self.fourier = None
         self.pool = pool
+        self.phi_mode = phi_mode
+        self.phi_index = int(phi_index)
 
         if use_fourier:
             self.fourier = FourierEncoder(
@@ -972,7 +886,10 @@ class DisplacedVertexGNN(nn.Module):
             raise ValueError(f"Unknown layer_type={layer_type}")
 
         graph_dim = hdim * 2 if pool == "meanmax" else hdim
-        self.graph_head = MLP(in_dim=graph_dim, out_dim=3, hidden_dim=hdim, n_layers=3, dropout=dropout)
+        self.heads = nn.ModuleList()
+        for i in range(3):
+            out_dim = 2 if (i == self.phi_index and self.phi_mode == "sincos") else 1
+            self.heads.append(MLP(in_dim=graph_dim, out_dim=out_dim, hidden_dim=hdim, n_layers=3, dropout=dropout))
 
     def forward(self, x, edge_index, edge_attr, edge_dropout_p: float = 0.0):
         if self.fourier is not None:
@@ -987,49 +904,16 @@ class DisplacedVertexGNN(nn.Module):
                 h = layer(h, edge_index)
 
         g = global_pool(h, mode=self.pool)
-        out = self.graph_head(g).squeeze(0)
+        out = []
+        for head in self.heads:
+            v = head(g).squeeze(0)
+            out.append(v)
         return out
 
-
-# ============================================================
-# Training utilities
-# ============================================================
-
-@torch.no_grad()
-def estimate_target_stats(train_ds, device, max_events: int = -1):
-    """Estimate mean/std of y_vertex. Rank0 computes and broadcasts."""
-    if ddp_is_main():
-        loader = DataLoader(
-            train_ds, batch_size=1, shuffle=False, num_workers=0,
-            pin_memory=False, collate_fn=collate_one,
-        )
-        ys = []
-        for i, batch in enumerate(loader):
-            if max_events > 0 and i >= max_events:
-                break
-            ys.append(batch["y_vertex"].float().view(1, 3))
-
-        if len(ys) == 0:
-            mean = torch.zeros(3, dtype=torch.float32, device=device)
-            std = torch.ones(3, dtype=torch.float32, device=device)
-        else:
-            y = torch.cat(ys, dim=0).to(device)
-            mean = y.mean(dim=0)
-            std = y.std(dim=0, unbiased=False).clamp(min=1e-6)
-    else:
-        mean = torch.zeros(3, dtype=torch.float32, device=device)
-        std = torch.ones(3, dtype=torch.float32, device=device)
-
-    if ddp_is_initialized():
-        dist.broadcast(mean, src=0)
-        dist.broadcast(std, src=0)
-
-    return mean, std
 
 @torch.no_grad()
 def estimate_target_transform(train_ds, device, mode: str = "none", max_events: int = -1, eps: float = 1e-6):
     mode = str(mode).lower()
-    eps = float(eps)
 
     if ddp_is_main():
         loader = DataLoader(
@@ -1089,78 +973,136 @@ def wrapped_angle_diff(
     period: float = 2.0 * math.pi,
 ) -> torch.Tensor:
     half_period = 0.5 * float(period)
-    return (
-        torch.remainder(pred_phi - target_phi + half_period, float(period)) - half_period
-    )
+    return torch.remainder(pred_phi - target_phi + half_period, float(period)) - half_period
+
+
+def angle_from_sincos(v: torch.Tensor) -> torch.Tensor:
+    v = v.reshape(-1)
+    if v.numel() != 2:
+        raise ValueError(f"Expected 2 values for sin/cos phi head, got shape {tuple(v.shape)}")
+    return torch.atan2(v[0], v[1])
+
+
+def component_regression_loss(diff: torch.Tensor, loss_name: str) -> torch.Tensor:
+    loss_name = loss_name.lower()
+    if loss_name == "mse":
+        return diff.pow(2)
+    if loss_name == "l1":
+        return diff.abs()
+    if loss_name == "smoothl1":
+        return F.smooth_l1_loss(diff, torch.zeros_like(diff), reduction="none")
+    raise ValueError(f"Unknown loss: {loss_name}")
+
+
+def parse_three_floats(text: str) -> Tuple[float, float, float]:
+    vals = [float(v.strip()) for v in text.split(",")]
+    if len(vals) != 3:
+        raise ValueError("Expected three comma-separated floats.")
+    return vals[0], vals[1], vals[2]
+
+
+def build_train_targets(
+    y: torch.Tensor,
+    target_center: torch.Tensor,
+    target_scale: torch.Tensor,
+    *,
+    phi_index: int,
+    phi_mode: str,
+) -> List[torch.Tensor]:
+    out: List[torch.Tensor] = []
+    for i in range(3):
+        if i == phi_index and phi_mode == "sincos":
+            phi = y[i]
+            out.append(torch.stack([torch.sin(phi), torch.cos(phi)], dim=0))
+        else:
+            out.append((y[i] - target_center[i]) / target_scale[i])
+    return out
+
+
+def decode_prediction_to_metric(
+    pred_parts: List[torch.Tensor],
+    target_center: torch.Tensor,
+    target_scale: torch.Tensor,
+    *,
+    phi_index: int,
+    phi_mode: str,
+) -> torch.Tensor:
+    out = []
+    for i in range(3):
+        p = pred_parts[i]
+        if i == phi_index and phi_mode == "sincos":
+            out.append(angle_from_sincos(p))
+        else:
+            out.append(p.reshape(-1)[0] * target_scale[i] + target_center[i])
+    return torch.stack(out, dim=0)
+
+
+def compute_total_loss(
+    pred_parts: List[torch.Tensor],
+    y: torch.Tensor,
+    target_center: torch.Tensor,
+    target_scale: torch.Tensor,
+    *,
+    loss_name: str,
+    phi_index: int,
+    phi_mode: str,
+    phi_period: float,
+    phi_vec_weight: float,
+    target_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    t = build_train_targets(y, target_center, target_scale, phi_index=phi_index, phi_mode=phi_mode)
+
+    comp_losses = []
+    for i in range(3):
+        p = pred_parts[i]
+        if i == phi_index and phi_mode == "sincos":
+            p_norm = F.normalize(p.reshape(-1), dim=0)
+            li = component_regression_loss(p_norm - t[i], loss_name=loss_name).mean()
+            li = phi_vec_weight * li
+        elif i == phi_index:
+            pred_scalar = p.reshape(-1)[0]
+            diff = wrapped_angle_diff(pred_scalar, t[i], period=phi_period / float(target_scale[i].item()))
+            li = component_regression_loss(diff, loss_name=loss_name).mean()
+        else:
+            pred_scalar = p.reshape(-1)[0]
+            diff = pred_scalar - t[i]
+            li = component_regression_loss(diff, loss_name=loss_name).mean()
+        comp_losses.append(li)
+
+    total = target_weights[0] * comp_losses[0] + target_weights[1] * comp_losses[1] + target_weights[2] * comp_losses[2]
+    pieces = {
+        "loss_0": comp_losses[0].detach(),
+        "loss_1": comp_losses[1].detach(),
+        "loss_2": comp_losses[2].detach(),
+    }
+    return total, pieces
 
 
 @torch.no_grad()
-def regression_stats(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mape_eps: float = 1e-6,
+def compute_metric_components(
+    pred_metric: torch.Tensor,
+    target_metric: torch.Tensor,
     *,
-    periodic_phi_loss: bool = False,
-    phi_index: int = 1,
-    phi_period: float = 2.0 * math.pi,
-) -> Tuple:
-    """
-    Compute regression statistics for a 3-component prediction.
+    phi_index: int,
+    phi_period: float,
+    mape_eps: float,
+) -> Dict[str, torch.Tensor]:
+    diff = pred_metric - target_metric
+    diff = diff.clone()
+    diff[phi_index] = wrapped_angle_diff(pred_metric[phi_index], target_metric[phi_index], period=phi_period)
 
-    Returns:
-        (mae, rmse, mape_pct, coord0_mae, coord1_mae, coord2_mae,
-         coord0_mape_pct, coord1_mape_pct, coord2_mape_pct)
-    """
-    diff = pred - target
-    if periodic_phi_loss:
-        diff = diff.clone()
-        diff[phi_index] = wrapped_angle_diff(
-            pred[phi_index], target[phi_index], period=phi_period
-        )
-    abs_diff = diff.abs()
-    sq_diff = diff.pow(2)
-    denom = target.abs().clamp(min=float(mape_eps))
-    ape = abs_diff / denom
-    mape_pct = 100.0 * ape.mean()
-    mae = abs_diff.mean()
-    rmse = torch.sqrt(sq_diff.mean())
-    return (
-        mae,
-        rmse,
-        mape_pct,
-        abs_diff[0],
-        abs_diff[1],
-        abs_diff[2],
-        100.0 * ape[0],
-        100.0 * ape[1],
-        100.0 * ape[2],
-    )
+    abs_err = diff.abs()
+    sq_err = diff.pow(2)
+    denom = target_metric.abs().clamp(min=float(mape_eps))
+    ape = 100.0 * abs_err / denom
+    smape = 200.0 * abs_err / (pred_metric.abs() + target_metric.abs()).clamp(min=float(mape_eps))
 
-
-def regression_loss_with_optional_periodic_phi(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    loss_name: str,
-    periodic_phi_loss: bool = False,
-    phi_index: int = 1,
-    phi_period: float = 2.0 * math.pi,
-) -> torch.Tensor:
-    diff = pred - target
-    if periodic_phi_loss:
-        diff = diff.clone()
-        diff[phi_index] = wrapped_angle_diff(
-            pred[phi_index], target[phi_index], period=phi_period
-        )
-
-    loss_name = loss_name.lower()
-    if loss_name == "mse":
-        return diff.pow(2).mean()
-    if loss_name == "l1":
-        return diff.abs().mean()
-    if loss_name == "smoothl1":
-        return F.smooth_l1_loss(diff, torch.zeros_like(diff), reduction="mean")
-    raise ValueError(f"Unknown loss: {loss_name}")
+    return {
+        "abs_err": abs_err.to(torch.float64),
+        "sq_err": sq_err.to(torch.float64),
+        "mape": ape.to(torch.float64),
+        "smape": smape.to(torch.float64),
+    }
 
 
 def build_scheduler(opt, args, steps_per_epoch: int):
@@ -1228,7 +1170,14 @@ def _try_resume_from_checkpoint(
         except Exception:
             pass
     if ema is not None and "ema_shadow" in ckpt and isinstance(ckpt["ema_shadow"], dict):
-        ema.shadow = {k: v.clone() for k, v in ckpt["ema_shadow"].items()}
+        raw_state = raw_model.state_dict()
+        ema.shadow = {
+            k: v.detach().to(device=raw_state[k].device, dtype=raw_state[k].dtype).clone()
+            if k in raw_state and torch.is_tensor(v)
+            else v.clone()
+            for k, v in ckpt["ema_shadow"].items()
+            if torch.is_tensor(v)
+        }
 
     last_epoch = int(ckpt.get("epoch", 0))
     best_monitor = ckpt.get("best_monitor", None)
@@ -1238,12 +1187,7 @@ def _try_resume_from_checkpoint(
     return start_epoch, best_monitor, bad_epochs, best_ckpt_epoch, True
 
 
-# ============================================================
-# Shared argparse setup
-# ============================================================
-
 def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add all shared training arguments to an ArgumentParser."""
     ap.add_argument("--data-glob", required=True)
     ap.add_argument("--split-file", required=True)
     ap.add_argument("--strict-split-check", action="store_true", default=False,
@@ -1279,11 +1223,17 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--feature-norm-clip", type=float, default=-1.0,
                     help="Optional absolute clip after feature normalization. <=0 disables clipping.")
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
-    
-    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="none",
-                    help=("Scale regression targets before loss computation. Use 'robust' if target components have very different ranges or outliers."),)
-    ap.add_argument("--target-scale-eps", type=float, default=1e-6, help="Numerical epsilon for target scaling.")
+
+    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="none")
+    ap.add_argument("--target-scale-eps", type=float, default=1e-6)
     ap.add_argument("--max-train-events", type=int, default=-1)
+
+    ap.add_argument("--phi-mode", default="sincos", choices=["sincos", "scalar"],
+                    help="Use sin/cos head for phi by default.")
+    ap.add_argument("--phi-vec-weight", type=float, default=1.0,
+                    help="Extra multiplier for the sin/cos phi loss.")
+    ap.add_argument("--target-loss-weights", default="1.0,1.0,1.0",
+                    help="Weights for the 3 target losses, in target order.")
 
     ap.add_argument("--save", default="displaced_vertex_gnn.pt")
     ap.add_argument("--save-dir", default=None)
@@ -1345,17 +1295,15 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     ap.add_argument("--edge-dropout", type=float, default=0.0)
     ap.add_argument("--feat-noise-std", type=float, default=0.0)
-    ap.add_argument("--mape-eps", type=float, default=1e-6,
-                    help="Minimum |target| in MAPE denominator to avoid division by zero.")
+    ap.add_argument("--mape-eps", type=float, default=1e-6)
 
     ap.add_argument("--periodic-phi-loss", action="store_true", default=False,
-                    help="Use shortest wrapped angular difference for the phi target in loss and metrics.")
+                    help="Only used for scalar-phi mode. For sincos, metrics are always wrapped in metric space.")
     ap.add_argument("--no-periodic-phi-loss", dest="periodic_phi_loss", action="store_false")
-    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi),
-                    help="Period used for wrapped phi differences in metric space. Default is 2*pi.")
+    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi))
     ap.add_argument("--phi-index", type=int, default=1,
                     help="Index of the angular phi target within y. For cylindrical targets [rho, phi, z], use 1.")
-     
+
     ap.add_argument("--ema", action="store_true", default=True)
     ap.add_argument("--no-ema", dest="ema", action="store_false")
     ap.add_argument("--ema-decay", type=float, default=0.999)
@@ -1363,21 +1311,7 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return ap
 
 
-# ============================================================
-# Full training loop
-# ============================================================
-
 def run_training(args, *, coordinate_system: str, target_labels: List[str]):
-    """
-    Full DDP training loop for DisplacedVertex graph regression.
-
-    Args:
-        args: parsed argparse namespace (from add_training_args)
-        coordinate_system: string identifying the target convention
-            (e.g. "cartesian", "cylindrical", "polar")
-        target_labels: list of 3 strings naming the target coordinates
-            (e.g. ["x","y","z"], ["rho","phi","z"], ["r","theta","phi"])
-    """
     assert len(target_labels) == 3, "target_labels must have exactly 3 elements"
 
     try:
@@ -1442,7 +1376,7 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             args.feature_stats_json,
             norm_kind=args.feature_norm_kind,
         )
-        
+
         if args.normalize_edge_features and not feature_stats["meta"]["has_edge_stats"]:
             raise SystemExit(
                 "Edge normalization was requested but the stats JSON does not contain edge stats.\n"
@@ -1549,12 +1483,16 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
     if ddp_is_main():
         print(f"[i] xdim={xdim} edim={edim}", flush=True)
 
+    if not (0 <= int(args.phi_index) < len(target_labels)):
+        raise ValueError(f"--phi-index={args.phi_index} is out of range for target_labels={target_labels}")
+
     model = DisplacedVertexGNN(
         xdim=xdim, edim=edim, hdim=args.hidden_dim, n_layers=args.layers,
         dropout=args.dropout, layer_type=args.layer_type, gat_heads=args.gat_heads,
         sage_aggr=args.sage_aggr, edgeconv_aggr=args.edgeconv_aggr, pool=args.pool,
         use_fourier=args.fourier, fourier_base=args.fourier_base,
         fourier_min_exp=args.fourier_min_exp, fourier_max_exp=args.fourier_max_exp,
+        phi_mode=args.phi_mode, phi_index=int(args.phi_index),
     ).to(device)
 
     if ddp_is_initialized():
@@ -1587,16 +1525,6 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
     except TypeError:
         opt = torch.optim.AdamW(param_groups, lr=args.lr)
 
-    # ----------------------------------------------------------
-    # Target transform used for loss-space training
-    #
-    # Backward compatibility:
-    #   - if --target-scale=none:
-    #       * --normalize-target  => standard scaling (mean/std)
-    #       * --no-normalize-target => identity
-    #   - if --target-scale is explicitly set to standard/robust/minmax,
-    #       it takes precedence over --normalize-target.
-    # ----------------------------------------------------------
     if args.target_scale != "none":
         effective_target_scale = args.target_scale
     else:
@@ -1610,29 +1538,21 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
         eps=args.target_scale_eps,
     )
 
-    # legacy aliases kept so existing codepaths/checkpoints remain readable
     target_mean = target_center
     target_std = target_scale
+    target_weights = torch.tensor(parse_three_floats(args.target_loss_weights), device=device, dtype=torch.float32)
 
     if ddp_is_main():
         labels_str = ", ".join(target_labels)
         print(f"[i] target_scale_mode={effective_target_scale}", flush=True)
         print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
         print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [{labels_str}]", flush=True)
-        print(
-            f"[i] periodic_phi_loss={args.periodic_phi_loss} "
-            f"phi_index={args.phi_index} phi_period={args.phi_period}",
-            flush=True,
-        )
+        print(f"[i] phi_mode={args.phi_mode} phi_index={args.phi_index} phi_period={args.phi_period}", flush=True)
+        print(f"[i] target_loss_weights={target_weights.detach().cpu().tolist()}", flush=True)
         if args.target_scale == "none" and args.normalize_target:
             print("[i] note: using legacy standard target normalization because --normalize-target is enabled.", flush=True)
         elif args.target_scale != "none":
             print(f"[i] note: --target-scale={args.target_scale} overrides --normalize-target/--no-normalize-target for loss-space scaling.", flush=True)
-            
-    if not (0 <= int(args.phi_index) < len(target_labels)):
-        raise ValueError(
-            f"--phi-index={args.phi_index} is out of range for target_labels={target_labels}"
-        )
 
     steps_per_epoch = len(train_loader)
     scheduler = build_scheduler(opt, args, steps_per_epoch=steps_per_epoch)
@@ -1673,6 +1593,9 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             "periodic_phi_loss": args.periodic_phi_loss,
             "phi_period": args.phi_period,
             "phi_index": args.phi_index,
+            "phi_mode": args.phi_mode,
+            "phi_vec_weight": args.phi_vec_weight,
+            "target_loss_weights": target_weights.detach().cpu().tolist(),
         }
 
         try:
@@ -1724,41 +1647,27 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
         else 0
     )
     reloaded_this_plateau = False
-    c0, c1, c2 = target_labels  # coordinate names for logging
+    c0, c1, c2 = target_labels
 
     for epoch in range(int(start_epoch), args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # -------------------------
-        # Train
-        # -------------------------
         model.train()
 
         train_loss = torch.tensor(0.0, device=device)
         train_steps = torch.tensor(0.0, device=device)
-        train_mae = torch.tensor(0.0, device=device)
-        train_rmse = torch.tensor(0.0, device=device)
-        train_mape = torch.tensor(0.0, device=device)
-        train_c0 = torch.tensor(0.0, device=device)
-        train_c1 = torch.tensor(0.0, device=device)
-        train_c2 = torch.tensor(0.0, device=device)
-        train_mape_c0 = torch.tensor(0.0, device=device)
-        train_mape_c1 = torch.tensor(0.0, device=device)
-        train_mape_c2 = torch.tensor(0.0, device=device)
+        train_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
+        train_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
+        train_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
+        train_mape_sum = torch.zeros(3, device=device, dtype=torch.float64)
+        train_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
 
         for batch in train_loader:
             x = batch["x"].to(device, non_blocking=True)
             edge_index = batch["edge_index"].to(device, non_blocking=True)
             edge_attr = batch["edge_attr"].to(device, non_blocking=True)
             y = batch["y_vertex"].to(device, non_blocking=True).float()
-            
-            if args.periodic_phi_loss:
-                phi_period_loss_space = args.phi_period / float(target_scale[int(args.phi_index)].item())
-            else:
-                phi_period_loss_space = args.phi_period
-
-            y_train = (y - target_center) / target_scale
 
             if args.feat_noise_std > 0.0 and model.training:
                 x = x + args.feat_noise_std * torch.randn_like(x)
@@ -1766,14 +1675,15 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
             opt.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                pred_train = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                loss = regression_loss_with_optional_periodic_phi(
-                    pred_train,
-                    y_train,
+                pred_parts = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
+                loss, pieces = compute_total_loss(
+                    pred_parts, y, target_center, target_scale,
                     loss_name=args.loss,
-                    periodic_phi_loss=args.periodic_phi_loss,
                     phi_index=int(args.phi_index),
-                    phi_period=phi_period_loss_space,
+                    phi_mode=args.phi_mode,
+                    phi_period=args.phi_period,
+                    phi_vec_weight=args.phi_vec_weight,
+                    target_weights=target_weights,
                 )
 
             if scaler.is_enabled():
@@ -1794,60 +1704,51 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                 scheduler.step()
 
             with torch.no_grad():
-                pred_metric = pred_train * target_scale + target_center
-                mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
-                    pred_metric, y, args.mape_eps,
-                    periodic_phi_loss=args.periodic_phi_loss,
+                pred_metric = decode_prediction_to_metric(
+                    pred_parts, target_center, target_scale,
+                    phi_index=int(args.phi_index), phi_mode=args.phi_mode,
+                )
+                metric_parts = compute_metric_components(
+                    pred_metric, y,
                     phi_index=int(args.phi_index),
                     phi_period=args.phi_period,
+                    mape_eps=args.mape_eps,
                 )
 
             train_loss += loss.detach()
             train_steps += 1.0
-            train_mae += mae
-            train_rmse += rmse
-            train_mape += mape
-            train_c0 += mc0
-            train_c1 += mc1
-            train_c2 += mc2
-            train_mape_c0 += mm0
-            train_mape_c1 += mm1
-            train_mape_c2 += mm2
+            train_loss_parts += torch.stack([pieces["loss_0"], pieces["loss_1"], pieces["loss_2"]]).to(torch.float64)
+            train_abs_err += metric_parts["abs_err"]
+            train_sq_err += metric_parts["sq_err"]
+            train_mape_sum += metric_parts["mape"]
+            train_smape_sum += metric_parts["smape"]
 
         for t in (
-            train_loss, train_steps, train_mae, train_rmse, train_mape,
-            train_c0, train_c1, train_c2, train_mape_c0, train_mape_c1, train_mape_c2,
+            train_loss, train_steps, train_loss_parts, train_abs_err, train_sq_err, train_mape_sum, train_smape_sum,
         ):
             ddp_all_reduce_sum(t)
 
         n_steps = torch.clamp(train_steps, min=1.0)
         train_loss_mean = (train_loss / n_steps).item()
-        train_mae_mean = (train_mae / n_steps).item()
-        train_rmse_mean = (train_rmse / n_steps).item()
-        train_mape_mean = (train_mape / n_steps).item()
-        train_c0_mean = (train_c0 / n_steps).item()
-        train_c1_mean = (train_c1 / n_steps).item()
-        train_c2_mean = (train_c2 / n_steps).item()
-        train_mape_c0_mean = (train_mape_c0 / n_steps).item()
-        train_mape_c1_mean = (train_mape_c1 / n_steps).item()
-        train_mape_c2_mean = (train_mape_c2 / n_steps).item()
+        train_loss_parts_mean = (train_loss_parts / n_steps).cpu().numpy()
+        train_mae_components = (train_abs_err / n_steps).cpu().numpy()
+        train_rmse_components = torch.sqrt(train_sq_err / n_steps).cpu().numpy()
+        train_mape_components = (train_mape_sum / n_steps).cpu().numpy()
+        train_smape_components = (train_smape_sum / n_steps).cpu().numpy()
+        train_mae_mean = float(np.mean(train_mae_components))
+        train_rmse_mean = float(np.mean(train_rmse_components))
+        train_mape_mean = float(np.mean(train_mape_components))
+        train_smape_mean = float(np.mean(train_smape_components))
 
-        # -------------------------
-        # Validation
-        # -------------------------
         model.eval()
 
         val_loss = torch.tensor(0.0, device=device)
         val_steps = torch.tensor(0.0, device=device)
-        val_mae = torch.tensor(0.0, device=device)
-        val_rmse = torch.tensor(0.0, device=device)
-        val_mape = torch.tensor(0.0, device=device)
-        val_c0 = torch.tensor(0.0, device=device)
-        val_c1 = torch.tensor(0.0, device=device)
-        val_c2 = torch.tensor(0.0, device=device)
-        val_mape_c0 = torch.tensor(0.0, device=device)
-        val_mape_c1 = torch.tensor(0.0, device=device)
-        val_mape_c2 = torch.tensor(0.0, device=device)
+        val_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
+        val_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
+        val_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
+        val_mape_sum = torch.zeros(3, device=device, dtype=torch.float64)
+        val_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
 
         eval_ctx = ema.apply_to(model) if ema is not None else nullcontext()
         with eval_ctx:
@@ -1857,62 +1758,54 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     edge_index = batch["edge_index"].to(device, non_blocking=True)
                     edge_attr = batch["edge_attr"].to(device, non_blocking=True)
                     y = batch["y_vertex"].to(device, non_blocking=True).float()
-                    
-                    if args.periodic_phi_loss:
-                        phi_period_loss_space = args.phi_period / float(target_scale[int(args.phi_index)].item())
-                    else:
-                        phi_period_loss_space = args.phi_period
-
-                    y_eval = (y - target_center) / target_scale
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred_eval = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss = regression_loss_with_optional_periodic_phi(
-                            pred_eval,
-                            y_eval,
+                        pred_parts = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
+                        loss, pieces = compute_total_loss(
+                            pred_parts, y, target_center, target_scale,
                             loss_name=args.loss,
-                            periodic_phi_loss=args.periodic_phi_loss,
                             phi_index=int(args.phi_index),
-                            phi_period=phi_period_loss_space,
+                            phi_mode=args.phi_mode,
+                            phi_period=args.phi_period,
+                            phi_vec_weight=args.phi_vec_weight,
+                            target_weights=target_weights,
                         )
 
-                    pred_metric = pred_eval * target_scale + target_center
-                    mae, rmse, mape, mc0, mc1, mc2, mm0, mm1, mm2 = regression_stats(
-                        pred_metric, y, args.mape_eps,
-                        periodic_phi_loss=args.periodic_phi_loss,
+                    pred_metric = decode_prediction_to_metric(
+                        pred_parts, target_center, target_scale,
+                        phi_index=int(args.phi_index), phi_mode=args.phi_mode,
+                    )
+                    metric_parts = compute_metric_components(
+                        pred_metric, y,
                         phi_index=int(args.phi_index),
                         phi_period=args.phi_period,
+                        mape_eps=args.mape_eps,
                     )
 
                     val_loss += loss.detach()
                     val_steps += 1.0
-                    val_mae += mae
-                    val_rmse += rmse
-                    val_mape += mape
-                    val_c0 += mc0
-                    val_c1 += mc1
-                    val_c2 += mc2
-                    val_mape_c0 += mm0
-                    val_mape_c1 += mm1
-                    val_mape_c2 += mm2
+                    val_loss_parts += torch.stack([pieces["loss_0"], pieces["loss_1"], pieces["loss_2"]]).to(torch.float64)
+                    val_abs_err += metric_parts["abs_err"]
+                    val_sq_err += metric_parts["sq_err"]
+                    val_mape_sum += metric_parts["mape"]
+                    val_smape_sum += metric_parts["smape"]
 
         for t in (
-            val_loss, val_steps, val_mae, val_rmse, val_mape,
-            val_c0, val_c1, val_c2, val_mape_c0, val_mape_c1, val_mape_c2,
+            val_loss, val_steps, val_loss_parts, val_abs_err, val_sq_err, val_mape_sum, val_smape_sum,
         ):
             ddp_all_reduce_sum(t)
 
         n_val_steps = torch.clamp(val_steps, min=1.0)
         val_loss_mean = (val_loss / n_val_steps).item()
-        val_mae_mean = (val_mae / n_val_steps).item()
-        val_rmse_mean = (val_rmse / n_val_steps).item()
-        val_mape_mean = (val_mape / n_val_steps).item()
-        val_c0_mean = (val_c0 / n_val_steps).item()
-        val_c1_mean = (val_c1 / n_val_steps).item()
-        val_c2_mean = (val_c2 / n_val_steps).item()
-        val_mape_c0_mean = (val_mape_c0 / n_val_steps).item()
-        val_mape_c1_mean = (val_mape_c1 / n_val_steps).item()
-        val_mape_c2_mean = (val_mape_c2 / n_val_steps).item()
+        val_loss_parts_mean = (val_loss_parts / n_val_steps).cpu().numpy()
+        val_mae_components = (val_abs_err / n_val_steps).cpu().numpy()
+        val_rmse_components = torch.sqrt(val_sq_err / n_val_steps).cpu().numpy()
+        val_mape_components = (val_mape_sum / n_val_steps).cpu().numpy()
+        val_smape_components = (val_smape_sum / n_val_steps).cpu().numpy()
+        val_mae_mean = float(np.mean(val_mae_components))
+        val_rmse_mean = float(np.mean(val_rmse_components))
+        val_mape_mean = float(np.mean(val_mape_components))
+        val_smape_mean = float(np.mean(val_smape_components))
 
         if args.lr_schedule == "plateau":
             scheduler.step(val_loss_mean)
@@ -1925,24 +1818,21 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
         else:
             monitor_val = val_mae_mean
 
-        improved = (
-            best_monitor is None or
-            monitor_val < best_monitor - args.early_stop_min_delta
-        )
+        improved = (best_monitor is None or monitor_val < best_monitor - args.early_stop_min_delta)
 
         if ddp_is_main():
             print(
                 f"[epoch {epoch:03d}] "
-                f"train loss={train_loss_mean:.5f} mae={train_mae_mean:.5f} rmse={train_rmse_mean:.5f} "
-                f"mape={train_mape_mean:.2f}% "
-                f"({c0}=mae:{train_c0_mean:.5f}/mape:{train_mape_c0_mean:.2f}%, "
-                f"{c1}=mae:{train_c1_mean:.5f}/mape:{train_mape_c1_mean:.2f}%, "
-                f"{c2}=mae:{train_c2_mean:.5f}/mape:{train_mape_c2_mean:.2f}%) | "
-                f"val loss={val_loss_mean:.5f} mae={val_mae_mean:.5f} rmse={val_rmse_mean:.5f} "
-                f"mape={val_mape_mean:.2f}% "
-                f"({c0}=mae:{val_c0_mean:.5f}/mape:{val_mape_c0_mean:.2f}%, "
-                f"{c1}=mae:{val_c1_mean:.5f}/mape:{val_mape_c1_mean:.2f}%, "
-                f"{c2}=mae:{val_c2_mean:.5f}/mape:{val_mape_c2_mean:.2f}%) | "
+                f"train loss={train_loss_mean:.5f} parts=({train_loss_parts_mean[0]:.5f},{train_loss_parts_mean[1]:.5f},{train_loss_parts_mean[2]:.5f}) "
+                f"mae={train_mae_mean:.5f} rmse={train_rmse_mean:.5f} mape={train_mape_mean:.2f}% smape={train_smape_mean:.2f}% "
+                f"({c0}=mae:{train_mae_components[0]:.5f}/mape:{train_mape_components[0]:.2f}%/smape:{train_smape_components[0]:.2f}%, "
+                f"{c1}=mae:{train_mae_components[1]:.5f}/mape:{train_mape_components[1]:.2f}%/smape:{train_smape_components[1]:.2f}%, "
+                f"{c2}=mae:{train_mae_components[2]:.5f}/mape:{train_mape_components[2]:.2f}%/smape:{train_smape_components[2]:.2f}%) | "
+                f"val loss={val_loss_mean:.5f} parts=({val_loss_parts_mean[0]:.5f},{val_loss_parts_mean[1]:.5f},{val_loss_parts_mean[2]:.5f}) "
+                f"mae={val_mae_mean:.5f} rmse={val_rmse_mean:.5f} mape={val_mape_mean:.2f}% smape={val_smape_mean:.2f}% "
+                f"({c0}=mae:{val_mae_components[0]:.5f}/mape:{val_mape_components[0]:.2f}%/smape:{val_smape_components[0]:.2f}%, "
+                f"{c1}=mae:{val_mae_components[1]:.5f}/mape:{val_mape_components[1]:.2f}%/smape:{val_smape_components[1]:.2f}%, "
+                f"{c2}=mae:{val_mae_components[2]:.5f}/mape:{val_mape_components[2]:.2f}%/smape:{val_smape_components[2]:.2f}%) | "
                 f"lr={current_lr:.3e} | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}",
                 flush=True,
@@ -1953,25 +1843,45 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                 {
                     "epoch": epoch,
                     "train/loss": train_loss_mean,
+                    f"train/loss_{c0}": float(train_loss_parts_mean[0]),
+                    f"train/loss_{c1}": float(train_loss_parts_mean[1]),
+                    f"train/loss_{c2}": float(train_loss_parts_mean[2]),
                     "train/mae": train_mae_mean,
                     "train/rmse": train_rmse_mean,
                     "train/mape": train_mape_mean,
-                    f"train/mae_{c0}": train_c0_mean,
-                    f"train/mae_{c1}": train_c1_mean,
-                    f"train/mae_{c2}": train_c2_mean,
-                    f"train/mape_{c0}": train_mape_c0_mean,
-                    f"train/mape_{c1}": train_mape_c1_mean,
-                    f"train/mape_{c2}": train_mape_c2_mean,
+                    "train/smape": train_smape_mean,
+                    f"train/mae_{c0}": float(train_mae_components[0]),
+                    f"train/mae_{c1}": float(train_mae_components[1]),
+                    f"train/mae_{c2}": float(train_mae_components[2]),
+                    f"train/rmse_{c0}": float(train_rmse_components[0]),
+                    f"train/rmse_{c1}": float(train_rmse_components[1]),
+                    f"train/rmse_{c2}": float(train_rmse_components[2]),
+                    f"train/mape_{c0}": float(train_mape_components[0]),
+                    f"train/mape_{c1}": float(train_mape_components[1]),
+                    f"train/mape_{c2}": float(train_mape_components[2]),
+                    f"train/smape_{c0}": float(train_smape_components[0]),
+                    f"train/smape_{c1}": float(train_smape_components[1]),
+                    f"train/smape_{c2}": float(train_smape_components[2]),
                     "val/loss": val_loss_mean,
+                    f"val/loss_{c0}": float(val_loss_parts_mean[0]),
+                    f"val/loss_{c1}": float(val_loss_parts_mean[1]),
+                    f"val/loss_{c2}": float(val_loss_parts_mean[2]),
                     "val/mae": val_mae_mean,
                     "val/rmse": val_rmse_mean,
                     "val/mape": val_mape_mean,
-                    f"val/mae_{c0}": val_c0_mean,
-                    f"val/mae_{c1}": val_c1_mean,
-                    f"val/mae_{c2}": val_c2_mean,
-                    f"val/mape_{c0}": val_mape_c0_mean,
-                    f"val/mape_{c1}": val_mape_c1_mean,
-                    f"val/mape_{c2}": val_mape_c2_mean,
+                    "val/smape": val_smape_mean,
+                    f"val/mae_{c0}": float(val_mae_components[0]),
+                    f"val/mae_{c1}": float(val_mae_components[1]),
+                    f"val/mae_{c2}": float(val_mae_components[2]),
+                    f"val/rmse_{c0}": float(val_rmse_components[0]),
+                    f"val/rmse_{c1}": float(val_rmse_components[1]),
+                    f"val/rmse_{c2}": float(val_rmse_components[2]),
+                    f"val/mape_{c0}": float(val_mape_components[0]),
+                    f"val/mape_{c1}": float(val_mape_components[1]),
+                    f"val/mape_{c2}": float(val_mape_components[2]),
+                    f"val/smape_{c0}": float(val_smape_components[0]),
+                    f"val/smape_{c1}": float(val_smape_components[1]),
+                    f"val/smape_{c2}": float(val_smape_components[2]),
                     "lr": current_lr,
                     args.early_stop_monitor: monitor_val,
                 },
@@ -2013,6 +1923,9 @@ def run_training(args, *, coordinate_system: str, target_labels: List[str]):
                     "periodic_phi_loss": args.periodic_phi_loss,
                     "phi_period": args.phi_period,
                     "phi_index": int(args.phi_index),
+                    "phi_mode": args.phi_mode,
+                    "phi_vec_weight": args.phi_vec_weight,
+                    "target_loss_weights": target_weights.detach().cpu(),
                     "normalize_node_features": args.normalize_node_features,
                     "normalize_edge_features": args.normalize_edge_features,
                     "feature_stats_json": args.feature_stats_json,

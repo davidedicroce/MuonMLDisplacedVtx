@@ -8,7 +8,7 @@ Target: y_vertex = [rho, phi, z]  (m, rad, m)
 Example:
 python -u DisplacedVertex_converter_cylindrical.py \
     --input-dir /eos/project-f/fcc-ml/ddicroce/ATLAS_MuonSpectrometer/data/data_displacedVtx_regressor/ \
-    --pattern "MuonBucketDump_group.det-muon.*root" \
+    --pattern "MuonBucketDump_vertex_a_mumu*.root" \
     --output-dir ./data_cylindrical \
     --output-name displaced_vertex_dataset \
     --vertex-r-max-mm 8000.0 \
@@ -16,7 +16,7 @@ python -u DisplacedVertex_converter_cylindrical.py \
     --calo-r-max-mm 4250 \
     --calo-z-max-mm 6500 \
     --min-tower-energy-mev 1500 \
-    --max-tower-segment-dr 0.4
+    --max-tower-segment-dr 0.4  2>&1 | tee log_converter.txt
 """
 
 import argparse
