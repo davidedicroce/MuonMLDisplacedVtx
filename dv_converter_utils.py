@@ -6,6 +6,7 @@ Shared utilities for DisplacedVertex converter scripts:
   DisplacedVertex_converter_cartesian.py
   DisplacedVertex_converter_cylindrical.py
   DisplacedVertex_converter_polar.py
+  DisplacedVertex.py
 
 Contains:
   - Required branch lists
@@ -17,6 +18,8 @@ Contains:
   - HDF5 writing helpers
   - Shared argparse setup
   - Shared converter main loop
+  - DisplacedVertex graph-classification conversion helpers
+  - Lazy HDF5 dataset and collate helpers for DisplacedVertex graphs
 """
 
 import os
@@ -26,7 +29,10 @@ from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
-import uproot
+try:
+    import uproot
+except ImportError:  # ROOT reading needs uproot, but HDF5 dataset helpers can still be imported.
+    uproot = None
 import h5py
 
 
@@ -78,6 +84,8 @@ def _normalize_keys(keys):
 
 
 def _open_tree_by_name(root_file: str, tree_name: str):
+    if uproot is None:
+        raise ImportError("uproot is required to read ROOT files. Install it in the conversion environment.")
     f = uproot.open(root_file)
     if tree_name not in f:
         candidates = [k.split(";")[0] for k in f.keys()]
@@ -855,3 +863,846 @@ def run_converter_main_loop(args, build_vertex_target_fn, build_muon_nodes_fn, b
     h5.attrs["skipped_empty_or_too_small"] = skipped
     h5.close()
     print(f"[done] wrote {total_written} graphs across all files")
+# ===========================================================================
+# DisplacedVertex graph classification utilities
+# ===========================================================================
+
+# The functions below are intentionally additive: the regression converters above
+# keep their original behaviour, while the new DisplacedVertex.py classifier can
+# reuse the same ROOT reading, node-building, edge-building, and HDF5 machinery.
+
+def _lazy_import_torch():
+    """Import torch only when dataset/collate helpers need it."""
+    try:
+        import torch
+        return torch
+    except Exception as exc:  # pragma: no cover - depends on runtime environment
+        raise ImportError(
+            "PyTorch is required for DisplacedVertexGraphDataset/collate helpers, "
+            "but it could not be imported. ROOT -> HDF5 conversion does not need torch."
+        ) from exc
+
+
+DEFAULT_DV_SIGNAL_FILENAME_PATTERNS = [
+    "*a_mumu_*.root",
+    "*Haa_4mu_*.root",
+]
+
+
+def _normalize_signal_filename_patterns(signal_filename_patterns=None) -> list[str]:
+    """Return signal filename patterns as a concrete list."""
+    if signal_filename_patterns is None:
+        return list(DEFAULT_DV_SIGNAL_FILENAME_PATTERNS)
+    if isinstance(signal_filename_patterns, str):
+        return [signal_filename_patterns]
+    return list(signal_filename_patterns)
+
+
+def _filename_matches_signal_patterns(
+    root_path: str,
+    signal_filename_patterns=None,
+) -> bool:
+    """Return True when the ROOT basename matches any configured signal pattern."""
+    import fnmatch
+
+    basename = os.path.basename(root_path)
+    signal_filename_patterns = _normalize_signal_filename_patterns(signal_filename_patterns)
+    return any(fnmatch.fnmatch(basename, pat) for pat in signal_filename_patterns)
+
+
+# Backward-compatible alias for older code paths.
+_filename_matches_signal_pattern = _filename_matches_signal_patterns
+
+def _event_vertex_rhos_mm(vertex_td, idxs) -> np.ndarray:
+    """Return all truth-vertex rho values for an event in millimetres."""
+    if vertex_td is None or idxs is None:
+        return np.zeros((0,), dtype=np.float32)
+
+    rhos = []
+    for i in idxs:
+        xs = np.asarray(vertex_td["truthMuonVertexPositionX"][i]).ravel()
+        ys = np.asarray(vertex_td["truthMuonVertexPositionY"][i]).ravel()
+        n = min(len(xs), len(ys))
+        if n == 0:
+            continue
+        for j in range(n):
+            x = xs[j]
+            y = ys[j]
+            if x is None or y is None:
+                continue
+            x = float(x)
+            y = float(y)
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
+            rhos.append(np.hypot(x, y))
+
+    return np.asarray(rhos, dtype=np.float32)
+
+
+def compute_displaced_vertex_graph_label(
+    root_path: str,
+    vertex_td=None,
+    vx_idxs=None,
+    signal_filename_patterns=None,
+    signal_r_min_mm: float = 800.0,
+    signal_r_max_mm: float = 8000.0,
+) -> tuple[int, np.ndarray]:
+    """
+    Compute the graph-level binary label for one event.
+
+    Label definition:
+      - files whose basename does not match any configured signal pattern are background (0)
+      - matching files are signal (1) only when at least one truth vertex has
+        ``signal_r_min_mm < rho < signal_r_max_mm``
+
+    Returns ``(label, vertex_rhos_mm)``. Boundaries are strict to match
+    "higher than 800 mm and lower than 8000 mm".
+    """
+    rhos_mm = _event_vertex_rhos_mm(vertex_td, vx_idxs)
+
+    if not _filename_matches_signal_patterns(root_path, signal_filename_patterns):
+        return 0, rhos_mm
+
+    in_window = (rhos_mm > float(signal_r_min_mm)) & (rhos_mm < float(signal_r_max_mm))
+    return int(np.any(in_window)), rhos_mm
+
+
+def _eta_from_xyz_mm(x_mm, y_mm, z_mm) -> np.ndarray:
+    """Compute pseudorapidity from Cartesian positions in millimetres."""
+    x_mm = np.asarray(x_mm, dtype=np.float32)
+    y_mm = np.asarray(y_mm, dtype=np.float32)
+    z_mm = np.asarray(z_mm, dtype=np.float32)
+    r_xy = np.hypot(x_mm, y_mm)
+    eta = np.empty_like(r_xy, dtype=np.float32)
+    mask = r_xy > 0
+    eta[mask] = np.arcsinh(z_mm[mask] / r_xy[mask])
+    eta[~mask] = np.sign(z_mm[~mask]) * 1.0e6
+    return eta.astype(np.float32)
+
+
+def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs):
+    """
+    Build muon-segment nodes using the cylindrical converter feature convention.
+
+    Node features:
+        [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
+
+    For muon segments, ``energy_like`` is zero and ``nCells_or_DoF`` is the
+    segment number of degrees of freedom.
+    """
+    raw = _collect_muon_raw(muon_td, idxs)
+    if raw is None:
+        return None
+
+    x_mm, y_mm, z_mm = raw["x_mm"], raw["y_mm"], raw["z_mm"]
+    pos_m = np.stack([x_mm, y_mm, z_mm], axis=1).astype(np.float32) / 1000.0
+
+    r_pos, theta_pos, phi_pos = _cartesian_to_atlas_position_polar(
+        pos_m[:, 0], pos_m[:, 1], pos_m[:, 2]
+    )
+    theta_dir, phi_dir, dir_u = _cartesian_to_atlas_direction_angles(
+        raw["dx"], raw["dy"], raw["dz"]
+    )
+
+    phi = np.arctan2(y_mm, x_mm).astype(np.float32)
+    eta = _eta_from_xyz_mm(x_mm, y_mm, z_mm)
+    energy_like = np.zeros(len(x_mm), dtype=np.float32)
+    ncells_or_dof = raw["segment_dof"].astype(np.float32)
+
+    x = np.stack(
+        [r_pos, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, ncells_or_dof],
+        axis=1,
+    ).astype(np.float32)
+
+    return {
+        "x": x,
+        "phi": phi,
+        "eta": eta,
+        "energy_like": energy_like,
+        "dir_u": dir_u,
+        "sector": raw["bucket_sector"].astype(np.int64),
+        "node_type": np.zeros(len(x_mm), dtype=np.int64),
+        "muon_xyz_m": pos_m,
+        "muon_bucket": np.stack(
+            [
+                raw["bucket_chamber"].astype(np.int64),
+                raw["bucket_layers"].astype(np.int64),
+                raw["bucket_sector"].astype(np.int64),
+                raw["bucket_seg"].astype(np.int64),
+            ],
+            axis=1,
+        ),
+    }
+
+
+def build_displaced_vertex_calo_nodes_cylindrical(
+    calo_td,
+    idxs,
+    sector_mod: int,
+    min_tower_energy_mev: float,
+    max_tower_segment_dr: float,
+    calo_r_max_mm: float,
+    calo_z_max_mm: float,
+    seg_eta_list,
+    seg_phi_list,
+):
+    """
+    Build calorimeter tower nodes using the cylindrical converter convention.
+
+    Towers are filtered by energy, ΔR to muon segments, and the calorimeter
+    envelope intersection, matching the previous cylindrical converter logic.
+    """
+    raw = _collect_calo_filtered(
+        calo_td,
+        idxs,
+        seg_eta_list,
+        seg_phi_list,
+        sector_mod,
+        min_tower_energy_mev,
+        max_tower_segment_dr,
+        calo_r_max_mm,
+        calo_z_max_mm,
+    )
+    if raw is None:
+        return None
+
+    tower_xyz_m = raw["tower_xyz_m"]
+    r_pos, theta_pos, phi_pos = _cartesian_to_atlas_position_polar(
+        tower_xyz_m[:, 0], tower_xyz_m[:, 1], tower_xyz_m[:, 2]
+    )
+    theta_dir, phi_dir, dir_u = _cartesian_to_atlas_direction_angles(
+        raw["dx"], raw["dy"], raw["dz"]
+    )
+
+    x = np.stack(
+        [
+            r_pos,
+            theta_pos,
+            phi_pos,
+            theta_dir,
+            phi_dir,
+            raw["tower_energy"],
+            raw["tower_ncells"],
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    return {
+        "x": x,
+        "phi": raw["tower_phi"].astype(np.float32),
+        "eta": raw["tower_eta"].astype(np.float32),
+        "energy_like": raw["tower_energy"].astype(np.float32),
+        "dir_u": dir_u,
+        "sector": raw["sector"].astype(np.int64),
+        "node_type": np.ones(len(raw["tower_energy"]), dtype=np.int64),
+        "tower_xyz_m": tower_xyz_m.astype(np.float32),
+        "tower_min_dr": raw["tower_min_dr"].astype(np.float32),
+    }
+
+
+def assemble_displaced_vertex_graph(
+    mu_nodes,
+    calo_nodes,
+    max_tower_segment_dr: float,
+    require_edges: bool = False,
+):
+    """Concatenate node dictionaries and build edge_index/edge_attr."""
+    if (mu_nodes is None) and (calo_nodes is None):
+        return None
+
+    pieces, phi_pieces, eta_pieces = [], [], []
+    energy_like_pieces, dir_pieces, sector_pieces, type_pieces = [], [], [], []
+    n_muon_nodes = 0
+    n_calo_nodes = 0
+    muon_xyz_m = muon_bucket = tower_xyz_m = tower_min_dr = None
+
+    if mu_nodes is not None:
+        pieces.append(mu_nodes["x"])
+        phi_pieces.append(mu_nodes["phi"])
+        eta_pieces.append(mu_nodes["eta"])
+        energy_like_pieces.append(mu_nodes["energy_like"])
+        dir_pieces.append(mu_nodes["dir_u"])
+        sector_pieces.append(mu_nodes["sector"])
+        type_pieces.append(mu_nodes["node_type"])
+        n_muon_nodes = int(mu_nodes["x"].shape[0])
+        muon_xyz_m = mu_nodes.get("muon_xyz_m")
+        muon_bucket = mu_nodes.get("muon_bucket")
+
+    if calo_nodes is not None:
+        pieces.append(calo_nodes["x"])
+        phi_pieces.append(calo_nodes["phi"])
+        eta_pieces.append(calo_nodes["eta"])
+        energy_like_pieces.append(calo_nodes["energy_like"])
+        dir_pieces.append(calo_nodes["dir_u"])
+        sector_pieces.append(calo_nodes["sector"])
+        type_pieces.append(calo_nodes["node_type"])
+        n_calo_nodes = int(calo_nodes["x"].shape[0])
+        tower_xyz_m = calo_nodes.get("tower_xyz_m")
+        tower_min_dr = calo_nodes.get("tower_min_dr")
+
+    x = np.concatenate(pieces, axis=0).astype(np.float32)
+    if x.shape[0] == 0:
+        return None
+
+    phi = np.concatenate(phi_pieces, axis=0).astype(np.float32)
+    eta = np.concatenate(eta_pieces, axis=0).astype(np.float32)
+    energy_like = np.concatenate(energy_like_pieces, axis=0).astype(np.float32)
+    dir_u = np.concatenate(dir_pieces, axis=0).astype(np.float32)
+    sector = np.concatenate(sector_pieces, axis=0).astype(np.int64)
+    node_type = np.concatenate(type_pieces, axis=0).astype(np.int64)
+
+    edge_index = build_edges_segment_tower_by_dr(
+        phi=phi,
+        eta=eta,
+        node_type=node_type,
+        max_tower_segment_dr=max_tower_segment_dr,
+    ).astype(np.int64)
+
+    if require_edges and edge_index.shape[1] == 0:
+        return None
+
+    edge_attr = edge_features(
+        energy_like=energy_like,
+        phi=phi,
+        eta=eta,
+        dir_u=dir_u,
+        sector=sector,
+        node_type=node_type,
+        edge_index=edge_index,
+    ).astype(np.float32)
+
+    return {
+        "x": x,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "phi": phi,
+        "eta": eta,
+        "energy_like": energy_like,
+        "dir_u": dir_u,
+        "sector": sector,
+        "node_type": node_type,
+        "n_muon_nodes": n_muon_nodes,
+        "n_calo_nodes": n_calo_nodes,
+        "muon_xyz_m": muon_xyz_m,
+        "muon_bucket": muon_bucket,
+        "tower_xyz_m": tower_xyz_m,
+        "tower_min_dr": tower_min_dr,
+    }
+
+
+def _try_read_optional_tree(root_path: str, tree_name: str, required_branches):
+    """Read an optional tree; return ``(None, {}, [])`` when absent/incompatible."""
+    try:
+        return _read_tree(root_path, tree_name, required_branches)
+    except Exception as exc:
+        print(f"[w] optional tree '{tree_name}' unavailable in {root_path}: {exc}")
+        return None, defaultdict(list), []
+
+
+def iter_displaced_vertex_classification_samples(
+    root_path: str,
+    muon_tree_name: str = "MuonBucketDump",
+    calo_tree_name: str = "CaloDump",
+    vertex_tree_name: str = "MuonVertexDump",
+    signal_filename_patterns=None,
+    signal_r_min_mm: float = 800.0,
+    signal_r_max_mm: float = 8000.0,
+    sector_mod: int = 16,
+    min_tower_energy_mev: float = 1000.0,
+    max_tower_segment_dr: float = 0.4,
+    calo_r_max_mm: float = 4250.0,
+    calo_z_max_mm: float = 6500.0,
+    min_segments: int = 1,
+    require_edges: bool = False,
+    max_events: int = -1,
+):
+    """
+    Yield one graph-classification sample per ROOT event that has usable nodes.
+
+    Each yielded sample contains numpy arrays with keys:
+      x, edge_index, edge_attr, y, labels, phi, eta, energy_like, dir_u,
+      sector, node_type, and optional diagnostic arrays.
+    """
+    signal_filename_patterns = _normalize_signal_filename_patterns(signal_filename_patterns)
+    mu_td, mu_ev_to_idx, mu_keys = _read_tree(root_path, muon_tree_name, REQUIRED_MUON_BRANCHES)
+    ca_td, ca_ev_to_idx, _ = _try_read_optional_tree(root_path, calo_tree_name, REQUIRED_CALO_BRANCHES)
+    vx_td, vx_ev_to_idx, _ = _try_read_optional_tree(root_path, vertex_tree_name, REQUIRED_VERTEX_BRANCHES)
+
+    dataset_name = _dataset_name_from_root_path(root_path)
+    is_signal_file = _filename_matches_signal_patterns(root_path, signal_filename_patterns)
+    if is_signal_file and vx_td is None:
+        print(
+            f"[w] {os.path.basename(root_path)} matches one of {signal_filename_patterns}, "
+            "but no usable vertex tree was found; signal-candidate events will be skipped."
+        )
+
+    yielded = 0
+    for evh in mu_keys:
+        if max_events > 0 and yielded >= max_events:
+            break
+
+        mu_idxs = np.asarray(mu_ev_to_idx[evh], dtype=np.int64)
+        if min_segments > 0 and not _event_has_min_segments_and_truth(
+            mu_td,
+            mu_idxs,
+            min_segments=min_segments,
+            require_truth=False,
+            min_truth=0,
+        ):
+            continue
+
+        vx_idxs = (
+            np.asarray(vx_ev_to_idx[evh], dtype=np.int64)
+            if vx_td is not None and evh in vx_ev_to_idx
+            else None
+        )
+        label, vertex_rhos_mm = compute_displaced_vertex_graph_label(
+            root_path=root_path,
+            vertex_td=vx_td,
+            vx_idxs=vx_idxs,
+            signal_filename_patterns=signal_filename_patterns,
+            signal_r_min_mm=signal_r_min_mm,
+            signal_r_max_mm=signal_r_max_mm,
+        )
+
+        # For signal-pattern files, skip only this event/graph and continue processing the rest of the ROOT file.
+        if is_signal_file and label != 1:
+            continue
+
+        mu_nodes = build_displaced_vertex_muon_nodes_cylindrical(mu_td, mu_idxs)
+        if mu_nodes is None:
+            continue
+
+        calo_nodes = None
+        if ca_td is not None and evh in ca_ev_to_idx:
+            calo_nodes = build_displaced_vertex_calo_nodes_cylindrical(
+                ca_td,
+                np.asarray(ca_ev_to_idx[evh], dtype=np.int64),
+                sector_mod=sector_mod,
+                min_tower_energy_mev=min_tower_energy_mev,
+                max_tower_segment_dr=max_tower_segment_dr,
+                calo_r_max_mm=calo_r_max_mm,
+                calo_z_max_mm=calo_z_max_mm,
+                seg_eta_list=mu_nodes["eta"],
+                seg_phi_list=mu_nodes["phi"],
+            )
+
+        graph = assemble_displaced_vertex_graph(
+            mu_nodes=mu_nodes,
+            calo_nodes=calo_nodes,
+            max_tower_segment_dr=max_tower_segment_dr,
+            require_edges=require_edges,
+        )
+        if graph is None:
+            continue
+
+        y = np.asarray([label], dtype=np.float32)
+        sample = dict(graph)
+        sample.update(
+            {
+                "y": y,
+                "labels": y.copy(),
+                "event_hash": np.asarray(evh, dtype=np.int64),
+                "dataset_name": dataset_name,
+                "root_file": os.path.basename(root_path),
+                "is_signal_file": np.asarray([int(is_signal_file)], dtype=np.int8),
+                "vertex_rho_mm": vertex_rhos_mm.astype(np.float32),
+            }
+        )
+        yielded += 1
+        yield sample
+
+
+def _write_dv_classification_event_group(g, sample: dict) -> None:
+    """Write one DisplacedVertex graph-classification sample into an HDF5 group."""
+    event_hash = sample.get("event_hash")
+    if event_hash is not None:
+        g.attrs["event_hash"] = np.asarray(event_hash, dtype=np.int64)
+    g.attrs["label"] = int(np.asarray(sample["y"]).ravel()[0])
+    g.attrs["n_muon_nodes"] = int(sample.get("n_muon_nodes", 0))
+    g.attrs["n_calo_nodes"] = int(sample.get("n_calo_nodes", 0))
+    if sample.get("dataset_name") is not None:
+        g.attrs["dataset_name"] = str(sample["dataset_name"])
+    if sample.get("root_file") is not None:
+        g.attrs["root_file"] = str(sample["root_file"])
+
+    required = ["x", "edge_index", "edge_attr", "y", "labels"]
+    for key in required:
+        g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
+
+    for key in ("phi", "eta", "energy_like", "dir_u", "sector", "node_type", "is_signal_file", "vertex_rho_mm"):
+        if key in sample and sample[key] is not None:
+            g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
+
+    for key in ("muon_xyz_m", "muon_bucket", "tower_xyz_m", "tower_min_dr"):
+        if key in sample and sample[key] is not None:
+            g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
+
+
+def save_displaced_vertex_samples_to_hdf5(samples: list[dict], hdf5_path: str) -> None:
+    """Save an in-memory list of DisplacedVertex classification samples to HDF5."""
+    out_dir = os.path.dirname(hdf5_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with h5py.File(hdf5_path, "w") as h5:
+        h5.attrs["task"] = "graph_classification"
+        h5.attrs["n_events_written"] = len(samples)
+        events_grp = h5.create_group("events")
+        for i, sample in enumerate(samples):
+            _write_dv_classification_event_group(events_grp.create_group(f"{i:07d}"), sample)
+
+
+def convert_displaced_vertex_root_file(
+    root_path: str,
+    output_path: str,
+    overwrite: bool = False,
+    **kwargs,
+) -> tuple[int, int, int]:
+    """
+    Convert one ROOT file to one HDF5 file.
+
+    Returns ``(n_written, n_signal, n_background)``.
+    """
+    if os.path.exists(output_path) and not overwrite:
+        print(f"Skipping {os.path.basename(root_path)} → already exists: {output_path}")
+        return 0, 0, 0
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    tmp_path = f"{output_path}.tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    n_written = 0
+    n_signal = 0
+    n_background = 0
+
+    try:
+        with h5py.File(tmp_path, "w") as h5:
+            h5.attrs["source_root"] = os.path.abspath(root_path)
+            h5.attrs["task"] = "graph_classification"
+            h5.attrs["label_definition"] = (
+                "0=background for non-signal-pattern files; "
+                "1=signal for signal-pattern files if any truth vertex satisfies "
+                "r_min_mm < rho < r_max_mm; signal-pattern events outside this window are skipped"
+            )
+            events_grp = h5.create_group("events")
+
+            for sample in iter_displaced_vertex_classification_samples(root_path, **kwargs):
+                label = int(np.asarray(sample["y"]).ravel()[0])
+                if label == 1:
+                    n_signal += 1
+                else:
+                    n_background += 1
+
+                g = events_grp.create_group(f"{n_written:07d}")
+                _write_dv_classification_event_group(g, sample)
+                n_written += 1
+
+            h5.attrs["n_events_written"] = int(n_written)
+            h5.attrs["n_signal"] = int(n_signal)
+            h5.attrs["n_background"] = int(n_background)
+
+        os.replace(tmp_path, output_path)
+        print(
+            f"Saved {n_written} graphs to {output_path} "
+            f"(signal={n_signal}, background={n_background})"
+        )
+        return n_written, n_signal, n_background
+
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def add_dv_classification_converter_args(ap):
+    """Add command-line options for ``DisplacedVertex.py``."""
+    ap.add_argument("--dir-in", "--input-dir", dest="dir_in", required=True, help="Directory with ROOT files")
+    ap.add_argument("--dir-out", "--output-dir", dest="dir_out", required=True, help="Directory for per-file HDF5 outputs")
+    ap.add_argument("--pattern", default="*.root", help="Input ROOT glob pattern inside dir-in")
+    ap.add_argument("--overwrite", action="store_true", help="Re-create HDF5 files even when they already exist")
+    ap.add_argument("--max-events-per-file", type=int, default=-1, help="Optional cap per ROOT file (-1 = all usable events)")
+
+    ap.add_argument("--muon-tree-name", default="MuonBucketDump")
+    ap.add_argument("--calo-tree-name", default="CaloDump")
+    ap.add_argument("--vertex-tree-name", default="MuonVertexDump")
+
+    ap.add_argument("--signal-filename-patterns", "--signal-filename-pattern", nargs="+", default=DEFAULT_DV_SIGNAL_FILENAME_PATTERNS,
+        help="One or more fnmatch patterns treated as signal candidates.",)
+    
+    ap.add_argument("--signal-r-min-mm", type=float, default=800.0)
+    ap.add_argument("--signal-r-max-mm", type=float, default=8000.0)
+
+    ap.add_argument("--sector-mod", type=int, default=16)
+    ap.add_argument("--min-tower-energy-mev", type=float, default=1000.0)
+    ap.add_argument("--max-tower-segment-dr", type=float, default=0.4)
+    ap.add_argument("--calo-r-max-mm", type=float, default=4250.0)
+    ap.add_argument("--calo-z-max-mm", type=float, default=6500.0)
+    ap.add_argument("--min-segments", type=int, default=1, help="Minimum muon segments required to keep an event")
+    ap.add_argument("--require-edges", action="store_true", help="Skip graphs with no segment↔tower edges")
+    return ap
+
+
+def run_dv_directory_conversion(args) -> None:
+    """Run Bucket_converter-style per-file conversion with skip-existing logic."""
+    files = sorted(glob.glob(os.path.join(args.dir_in, args.pattern)))
+    os.makedirs(args.dir_out, exist_ok=True)
+    print(f"Found {len(files)} ROOT files in {args.dir_in}")
+
+    total_written = 0
+    total_signal = 0
+    total_background = 0
+    failed = 0
+
+    for root_path in files:
+        file_name = os.path.basename(root_path)
+        sample_name = os.path.splitext(file_name)[0]
+        output_path = os.path.join(args.dir_out, f"{sample_name}.h5")
+
+        if os.path.exists(output_path) and not args.overwrite:
+            print(f"Skipping {file_name} → already exists: {output_path}")
+            continue
+
+        print(f"Processing {file_name}")
+        try:
+            n_written, n_signal, n_background = convert_displaced_vertex_root_file(
+                root_path=root_path,
+                output_path=output_path,
+                overwrite=args.overwrite,
+                muon_tree_name=args.muon_tree_name,
+                calo_tree_name=args.calo_tree_name,
+                vertex_tree_name=args.vertex_tree_name,
+                signal_filename_patterns=args.signal_filename_patterns,
+                signal_r_min_mm=args.signal_r_min_mm,
+                signal_r_max_mm=args.signal_r_max_mm,
+                sector_mod=args.sector_mod,
+                min_tower_energy_mev=args.min_tower_energy_mev,
+                max_tower_segment_dr=args.max_tower_segment_dr,
+                calo_r_max_mm=args.calo_r_max_mm,
+                calo_z_max_mm=args.calo_z_max_mm,
+                min_segments=args.min_segments,
+                require_edges=args.require_edges,
+                max_events=args.max_events_per_file,
+            )
+            total_written += n_written
+            total_signal += n_signal
+            total_background += n_background
+        except Exception as exc:
+            failed += 1
+            print(f"Failed processing {file_name}: {exc}")
+
+    print(
+        "All files processed. "
+        f"graphs={total_written}, signal={total_signal}, background={total_background}, failed_files={failed}"
+    )
+
+
+def load_displaced_vertex_graphs_from_root(root_path: str, **kwargs) -> list[dict]:
+    """Build all usable DisplacedVertex classification graphs from one ROOT file in memory."""
+    return list(iter_displaced_vertex_classification_samples(root_path, **kwargs))
+
+
+class DisplacedVertexDataset:
+    """
+    ROOT-backed in-memory dataset, similar in spirit to ``BucketsDataset``.
+
+    Call ``_load_data()`` to populate ``data_list`` with one dictionary per graph.
+    If PyTorch is installed, ``__getitem__`` returns tensors for model-ready arrays.
+    """
+
+    def __init__(self, root_file: str | None = None, **kwargs):
+        self.root_file = root_file
+        self.kwargs = kwargs
+        self.data_list: list[dict] = []
+
+    def _load_data(self) -> list[dict]:
+        if not self.root_file:
+            raise ValueError("No ROOT file provided.")
+        self.data_list = load_displaced_vertex_graphs_from_root(self.root_file, **self.kwargs)
+        return self.data_list
+
+    def __len__(self) -> int:
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+
+        sample = self.data_list[idx]
+        try:
+            torch = _lazy_import_torch()
+        except ImportError:
+            return sample
+
+        return _dv_sample_to_torch(sample, torch)
+
+
+def _as_hdf5_path_list(hdf5_paths) -> list[str]:
+    if isinstance(hdf5_paths, (str, os.PathLike)):
+        hdf5_paths = [str(hdf5_paths)]
+    paths = []
+    for path in hdf5_paths:
+        path = str(path)
+        matches = sorted(glob.glob(path))
+        paths.extend(matches if matches else [path])
+    return paths
+
+
+def _dv_sample_to_torch(sample: dict, torch):
+    """Convert a numpy sample dictionary to torch tensors for training."""
+    out = {
+        "x": torch.tensor(sample["x"], dtype=torch.float32),
+        "features": torch.tensor(sample["x"], dtype=torch.float32),
+        "edge_index": torch.tensor(sample["edge_index"], dtype=torch.long),
+        "edge_attr": torch.tensor(sample["edge_attr"], dtype=torch.float32),
+        "y": torch.tensor(sample["y"], dtype=torch.float32),
+        "labels": torch.tensor(sample.get("labels", sample["y"]), dtype=torch.float32),
+    }
+    if out["edge_index"].dim() == 2 and out["edge_index"].shape[0] != 2:
+        out["edge_index"] = out["edge_index"].t().contiguous()
+
+    for key in ("phi", "eta", "energy_like", "dir_u", "sector", "node_type"):
+        if key in sample:
+            dtype = torch.long if key in ("sector", "node_type") else torch.float32
+            out[key] = torch.tensor(sample[key], dtype=dtype)
+    return out
+
+
+class H5DisplacedVertexGraphDataset:
+    """Lazy-loading PyTorch-style Dataset backed by one or more DV HDF5 files."""
+
+    def __init__(self, hdf5_paths):
+        self.hdf5_paths = _as_hdf5_path_list(hdf5_paths)
+        self.sample_map: list[tuple[int, str]] = []
+        self._files = [None] * len(self.hdf5_paths)
+
+        for file_idx, path in enumerate(self.hdf5_paths):
+            with h5py.File(path, "r") as f:
+                group = f["events"] if "events" in f else f
+                keys = sorted(k for k in group.keys())
+                self.sample_map.extend((file_idx, key) for key in keys)
+
+        self.length = len(self.sample_map)
+
+    def _get_file(self, file_idx: int):
+        if self._files[file_idx] is None:
+            self._files[file_idx] = h5py.File(self.hdf5_paths[file_idx], "r")
+        return self._files[file_idx]
+
+    def __getitem__(self, idx: int) -> dict:
+        torch = _lazy_import_torch()
+        file_idx, sample_key = self.sample_map[idx]
+        f = self._get_file(file_idx)
+        group = f["events"][sample_key] if "events" in f else f[sample_key]
+
+        sample = {key: group[key][()] for key in group.keys() if isinstance(group[key], h5py.Dataset)}
+        if "y" not in sample and "labels" in sample:
+            sample["y"] = sample["labels"]
+        if "labels" not in sample and "y" in sample:
+            sample["labels"] = sample["y"]
+        return _dv_sample_to_torch(sample, torch)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __del__(self):
+        for f in getattr(self, "_files", []):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+
+def load_displaced_vertex_graphs_from_hdf5(hdf5_paths, max_events: int | None = None) -> list[dict]:
+    """Load DV HDF5 graph samples into memory as numpy arrays."""
+    data_list = []
+    for path in _as_hdf5_path_list(hdf5_paths):
+        with h5py.File(path, "r") as f:
+            group = f["events"] if "events" in f else f
+            for key in sorted(group.keys()):
+                g = group[key]
+                sample = {name: g[name][()] for name in g.keys() if isinstance(g[name], h5py.Dataset)}
+                if "y" not in sample and "labels" in sample:
+                    sample["y"] = sample["labels"]
+                if "labels" not in sample and "y" in sample:
+                    sample["labels"] = sample["y"]
+                data_list.append(sample)
+                if max_events is not None and len(data_list) >= max_events:
+                    return data_list
+    return data_list
+
+
+def displaced_vertex_collate_fn(batch: list) -> dict:
+    """Collate variable-size DV graphs into a PyTorch mini-batch dictionary."""
+    torch = _lazy_import_torch()
+
+    x_list = [item["x"] for item in batch]
+    edge_index_list = [item["edge_index"] for item in batch]
+    edge_attr_list = [item["edge_attr"] for item in batch]
+    y_list = [item["y"].view(-1) for item in batch]
+
+    node_counts = [x.size(0) for x in x_list]
+    node_offsets = torch.tensor([0] + node_counts[:-1], dtype=torch.long).cumsum(dim=0)
+
+    shifted_edges = []
+    shifted_attrs = []
+    for i, edge_index in enumerate(edge_index_list):
+        if edge_index.numel() == 0:
+            continue
+        shifted_edges.append(edge_index + node_offsets[i])
+        shifted_attrs.append(edge_attr_list[i])
+
+    if shifted_edges:
+        edge_index = torch.cat(shifted_edges, dim=1)
+        edge_attr = torch.cat(shifted_attrs, dim=0)
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_dim = edge_attr_list[0].shape[1] if edge_attr_list and edge_attr_list[0].dim() == 2 else 5
+        edge_attr = torch.zeros((0, edge_dim), dtype=torch.float32)
+
+    batch_vec = torch.cat(
+        [torch.full((count,), i, dtype=torch.long) for i, count in enumerate(node_counts)],
+        dim=0,
+    )
+
+    return {
+        "x": torch.cat(x_list, dim=0),
+        "features": torch.cat(x_list, dim=0),
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "y": torch.cat(y_list, dim=0),
+        "labels": torch.cat(y_list, dim=0),
+        "batch": batch_vec,
+    }
+
+
+def validate_displaced_vertex_hdf5_files(paths) -> None:
+    """Print a warning for DV HDF5 groups missing required classifier datasets."""
+    required = ("x", "edge_index", "edge_attr", "y")
+    for path in _as_hdf5_path_list(paths):
+        print(f"Checking {path}")
+        with h5py.File(path, "r") as f:
+            group = f["events"] if "events" in f else f
+            for key in sorted(group.keys()):
+                g = group[key]
+                missing = [name for name in required if name not in g]
+                if missing:
+                    print(f"  ❌ Missing {missing} in {key} of {path}")
+
+
+def get_num_workers() -> int:
+    """Return a sensible number of DataLoader worker processes."""
+    import multiprocessing
+
+    num_cpus = multiprocessing.cpu_count()
+    print(f"Detected {num_cpus} CPU cores.")
+    return num_cpus
