@@ -885,7 +885,7 @@ def _lazy_import_torch():
 
 DEFAULT_DV_SIGNAL_FILENAME_PATTERNS = [
     "*a_mumu_*.root",
-    "*Haa_4mu_*.root",
+    "*Haa4mu_*.root",
 ]
 
 
@@ -908,7 +908,6 @@ def _filename_matches_signal_patterns(
     basename = os.path.basename(root_path)
     signal_filename_patterns = _normalize_signal_filename_patterns(signal_filename_patterns)
     return any(fnmatch.fnmatch(basename, pat) for pat in signal_filename_patterns)
-
 
 # Backward-compatible alias for older code paths.
 _filename_matches_signal_pattern = _filename_matches_signal_patterns
@@ -1706,3 +1705,79 @@ def get_num_workers() -> int:
     num_cpus = multiprocessing.cpu_count()
     print(f"Detected {num_cpus} CPU cores.")
     return num_cpus
+
+# -------------------------------------------------------
+# Classifier-chain HDF5 convenience helpers
+# -------------------------------------------------------
+
+def read_displaced_vertex_classifier_labels(hdf5_paths):
+    """
+    Return labels and lightweight metadata from one or more classifier HDF5 files.
+
+    This helper is intentionally schema-tolerant: labels can be stored as a dataset
+    named ``y`` or ``labels``, or as an event-group attribute named ``label``.
+    """
+    paths = _as_hdf5_path_list(hdf5_paths)
+    labels = []
+    dataset_names = []
+    root_files = []
+    event_refs = []
+    for file_idx, path in enumerate(paths):
+        with h5py.File(path, "r") as f:
+            group = f["events"] if "events" in f else f
+            for key in sorted(group.keys()):
+                g = group[key]
+                if "y" in g:
+                    y = g["y"][...]
+                elif "labels" in g:
+                    y = g["labels"][...]
+                elif "label" in g.attrs:
+                    y = np.asarray([g.attrs["label"]], dtype=np.float32)
+                else:
+                    raise RuntimeError(f"Missing classifier label in {path} /events/{key}")
+                y = np.asarray(y, dtype=np.float32).reshape(-1)
+                if y.size != 1 or y[0] not in (0.0, 1.0):
+                    raise RuntimeError(f"Expected scalar label 0/1 in {path} /events/{key}, got {y}")
+                labels.append(float(y[0]))
+                dataset_names.append(_decode_h5_string(g.attrs.get("dataset_name", "unknown")))
+                root_files.append(_decode_h5_string(g.attrs.get("root_file", os.path.basename(path))))
+                event_refs.append((file_idx, key))
+    return {
+        "labels": np.asarray(labels, dtype=np.float32),
+        "dataset_names": np.asarray(dataset_names, dtype=object),
+        "root_files": np.asarray(root_files, dtype=object),
+        "event_refs": np.asarray(event_refs, dtype=object),
+        "h5_paths": np.asarray([str(Path(p).resolve()) for p in paths], dtype=object),
+    }
+
+
+def _decode_h5_string(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    if isinstance(v, np.bytes_):
+        return v.tobytes().decode("utf-8", errors="replace")
+    return str(v)
+
+
+def summarize_displaced_vertex_classifier_h5_files(hdf5_paths) -> dict:
+    """Return event and label counts for classifier HDF5 files."""
+    meta = read_displaced_vertex_classifier_labels(hdf5_paths)
+    labels = meta["labels"]
+    n_signal = int(np.count_nonzero(labels == 1.0))
+    n_background = int(np.count_nonzero(labels == 0.0))
+    by_dataset = {}
+    for name, label in zip(meta["dataset_names"], labels):
+        row = by_dataset.setdefault(str(name), {"n_events": 0, "n_signal": 0, "n_background": 0})
+        row["n_events"] += 1
+        if int(label) == 1:
+            row["n_signal"] += 1
+        else:
+            row["n_background"] += 1
+    return {
+        "n_events": int(labels.size),
+        "n_signal": n_signal,
+        "n_background": n_background,
+        "positive_fraction": float(n_signal / max(labels.size, 1)),
+        "pos_weight_auto": float(n_background / max(n_signal, 1)) if n_signal > 0 else None,
+        "by_dataset": by_dataset,
+    }
