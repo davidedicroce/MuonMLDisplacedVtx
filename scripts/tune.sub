@@ -12,7 +12,7 @@ getenv = True
 
 # Adjust these paths for the batch filesystem if the submit directory is not
 # the repository root.
-environment = "REPO_DIR=$(SUBMIT_DIR)"
+environment = "REPO_DIR=$(SUBMIT_DIR) CLUSTER=$(Cluster) PROCESS=$(Process)"
 
 # GPU request. HTCondor GPU memory attributes are site-specific; many pools
 # expose per-GPU memory as TARGET.CUDAGlobalMemoryMb.

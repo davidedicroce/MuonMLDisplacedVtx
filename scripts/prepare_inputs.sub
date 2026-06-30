@@ -1,0 +1,21 @@
+universe = vanilla
+
+executable = /bin/bash
+arguments = scripts/prepare_inputs.sh
+
+log    = scripts/condor_logs/prepare_inputs.$(Cluster).log
+output = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).out
+error  = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).err
+
+should_transfer_files = NO
+getenv = True
+
+environment = "REPO_DIR=$(SUBMIT_DIR)"
+
+request_cpus = 4
+request_memory = 32 GB
+request_disk = 10 GB
+
++JobFlavour = "workday"
+
+queue 1

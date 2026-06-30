@@ -7,11 +7,12 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-$PWD}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-${REPO_DIR}/train_DisplacedVertex.py}"
 
-DATA_GLOB="${DATA_GLOB:-/shared/wp2p5/data/data_displacedVtx_mu200_graphs/*.h5}"
-SPLIT_FILE="${SPLIT_FILE:-/shared/wp2p5/data/data_displacedVtx_mu200_graphs/split_displaced_vertex_seed12345.npz}"
-FEATURE_STATS_JSON="${FEATURE_STATS_JSON:-/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json}"
+DATA_DIR="${DATA_DIR:-/eos/user/y/yshresth/mudb}"
+DATA_GLOB="${DATA_GLOB:-${DATA_DIR}/*.h5}"
+SPLIT_FILE="${SPLIT_FILE:-${DATA_DIR}/split_displaced_vertex_seed12345.npz}"
+FEATURE_STATS_JSON="${FEATURE_STATS_JSON:-${DATA_DIR}/normalization_stats_raw.json}"
 
-OUT_DIR="${OUT_DIR:-/shared/wp2p5/models/tuning_dv_classifier_gat}"
+OUT_DIR="${OUT_DIR:-/eos/user/y/yshresth/mounresult/tuning_dv_classifier_gat}"
 STUDY_NAME="${STUDY_NAME:-dv_classifier_gat}"
 
 N_TRIALS="${N_TRIALS:-30}"
@@ -23,13 +24,32 @@ REFIT_TOP_K="${REFIT_TOP_K:-2}"
 REFIT_EPOCHS="${REFIT_EPOCHS:-30}"
 REFIT_GPUS_PER_TRIAL="${REFIT_GPUS_PER_TRIAL:-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-300}"
+
+CONDOR_LOG_DIR="${CONDOR_LOG_DIR:-${REPO_DIR}/scripts/condor_logs}"
 
 cd "${REPO_DIR}"
+mkdir -p "${CONDOR_LOG_DIR}"
 
 echo "[tune.sh] host=$(hostname)"
 echo "[tune.sh] cwd=$(pwd)"
 echo "[tune.sh] started_at=$(date -Is)"
 echo "[tune.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+
+HEARTBEAT_PID=""
+(
+  while true; do
+    sleep "${HEARTBEAT_INTERVAL}"
+    completed_trials=0
+    if [ -f "${OUT_DIR}/trials.jsonl" ]; then
+      completed_trials=$(wc -l < "${OUT_DIR}/trials.jsonl" || echo 0)
+    fi
+    latest_log="$(find "${OUT_DIR}/logs" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)"
+    echo "[heartbeat] $(date -Is) completed_trial_records=${completed_trials} latest_trial_log=${latest_log:-none}"
+  done
+) &
+HEARTBEAT_PID="$!"
+trap 'if [ -n "${HEARTBEAT_PID}" ]; then kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true; fi' EXIT
 
 python -u "${REPO_DIR}/tune_DisplacedVertex_optuna.py" \
   --train-script "${TRAIN_SCRIPT}" \
