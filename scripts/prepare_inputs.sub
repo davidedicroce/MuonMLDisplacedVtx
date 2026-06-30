@@ -1,13 +1,11 @@
 universe = vanilla
 
-executable = /bin/bash
-arguments = scripts/prepare_inputs.sh
+executable = scripts/prepare_inputs.sh
 
 log    = scripts/condor_logs/prepare_inputs.$(Cluster).log
 output = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).out
 error  = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).err
 
-should_transfer_files = NO
 getenv = True
 
 environment = "REPO_DIR=$(SUBMIT_DIR)"

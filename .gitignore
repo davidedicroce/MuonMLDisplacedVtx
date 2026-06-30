@@ -15,7 +15,6 @@ wandb/
 *.h5
 *.npz
 *.log
-*.txt
 *.csv
 *.pdf
 *.png

@@ -1,13 +1,11 @@
 universe = vanilla
 
-executable = /bin/bash
-arguments = scripts/tune.sh
+executable = scripts/tune.sh
 
 log    = scripts/condor_logs/tune.$(Cluster).log
 output = scripts/condor_logs/tune.$(Cluster).$(Process).out
 error  = scripts/condor_logs/tune.$(Cluster).$(Process).err
 
-should_transfer_files = NO
 getenv = True
 
 # Adjust these paths for the batch filesystem if the submit directory is not
