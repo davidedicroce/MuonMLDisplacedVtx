@@ -1,0 +1,30 @@
+universe = vanilla
+
+executable = /bin/bash
+arguments = scripts/tune.sh
+
+log    = scripts/condor_logs/tune.$(Cluster).log
+output = scripts/condor_logs/tune.$(Cluster).$(Process).out
+error  = scripts/condor_logs/tune.$(Cluster).$(Process).err
+
+should_transfer_files = NO
+getenv = True
+
+# Adjust these paths for the batch filesystem if the submit directory is not
+# the repository root.
+environment = "REPO_DIR=$(SUBMIT_DIR)"
+
+# GPU request. HTCondor GPU memory attributes are site-specific; many pools
+# expose per-GPU memory as TARGET.CUDAGlobalMemoryMb.
+# Moderate tuning request: 4 x 50 GB GPUs, enough for 2 concurrent fast trials
+# at 2 GPUs each and for the 4-GPU refit stage.
+request_GPUs = 4
+requirements = TARGET.CUDAGlobalMemoryMb >= 50000
+
+request_cpus = 16
+request_memory = 96 GB
+request_disk = 20 GB
+
++JobFlavour = "workday"
+
+queue 1
