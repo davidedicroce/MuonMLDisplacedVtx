@@ -1,0 +1,19 @@
+# Core numerical / HDF5 / ROOT I/O
+numpy
+h5py
+uproot
+
+# Training and tuning
+torch
+optuna
+wandb
+
+# Evaluation / summaries / notebooks
+pandas
+scikit-learn
+matplotlib
+
+# ONNX export and ONNX Runtime evaluation used by DisplacedVertex_results_tune.py
+onnx
+onnxruntime
+
