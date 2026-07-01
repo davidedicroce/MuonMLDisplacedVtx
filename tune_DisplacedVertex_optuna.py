@@ -67,16 +67,26 @@ import optuna.logging
 import torch
 
 # ── notebook-friendly monitoring ───────────────────────────────────────────
-optuna.logging.set_verbosity(optuna.logging.INFO)   # show trial start/end events
+# Force unbuffered stdout so `!python ...` in Jupyter shows output in real time.
+# Without this, Jupyter's pipe-captured stdout buffers everything.
+import sys as _sys
+try:
+    _sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+os.environ["PYTHONUNBUFFERED"] = "1"  # also affects subprocesses
 
-SEP  = "═" * 72
-SEP2 = "─" * 72
+optuna.logging.set_verbosity(optuna.logging.INFO)
 
-def _log(*args, **kwargs):
-    """print + immediate flush so notebooks see output in real time."""
-    print(*args, **kwargs, flush=True)
+SEP  = "=" * 72
+SEP2 = "-" * 72
 
-def _banner(title: str, char: str = "═") -> None:
+def _log(msg: str = "") -> None:
+    """Write a line to stdout with immediate flush — works in notebooks."""
+    _sys.stdout.write(str(msg) + "\n")
+    _sys.stdout.flush()
+
+def _banner(title: str, char: str = "=") -> None:
     line = char * 72
     _log(f"\n{line}")
     _log(f"  {title}")
@@ -511,13 +521,13 @@ def run_one_training(
             log.write(line)
             log.flush()
             stripped = line.rstrip()
-            # Print every line from the subprocess so notebook sees raw output
-            print(stripped, flush=True)
-            # Also print a clean highlighted summary for epoch lines
+            # Write directly to stdout with explicit flush (not print)
+            _sys.stdout.write(stripped + "\n")
+            _sys.stdout.flush()
+            # Also emit a highlighted marker for epoch lines
             if stripped.startswith("[epoch"):
                 last_epoch_summary = stripped
-                # Re-print as a highlighted marker so it stands out in notebook
-                _log(f"  ▶ {trial_label} | {stripped}")
+                _log(f"  >> {trial_label} | {stripped}")
         rc = proc.wait()
     return rc
 
