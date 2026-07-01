@@ -12,15 +12,13 @@ getenv = True
 # the repository root.
 environment = "REPO_DIR=$(SUBMIT_DIR) CLUSTER=$(Cluster) PROCESS=$(Process)"
 
-# GPU request. HTCondor GPU memory attributes are site-specific; many pools
-# expose per-GPU memory as TARGET.CUDAGlobalMemoryMb.
-# Moderate tuning request: 4 x 50 GB GPUs, enough for 2 concurrent fast trials
-# at 2 GPUs each and for the 4-GPU refit stage.
-request_GPUs = 4
-requirements = TARGET.CUDAGlobalMemoryMb >= 50000
+# Single-GPU tuning request for faster scheduling. The tuner runs trials
+# sequentially with FAST_GPUS_PER_TRIAL=1 and N_JOBS=1.
+request_GPUs = 1
+requirements = TARGET.CUDAGlobalMemoryMb >= 16000
 
-request_cpus = 16
-request_memory = 96 GB
+request_cpus = 8
+request_memory = 32 GB
 request_disk = 20 GB
 
 +JobFlavour = "workday"
