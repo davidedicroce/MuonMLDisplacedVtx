@@ -15,10 +15,9 @@ environment = "REPO_DIR=$(SUBMIT_DIR) CLUSTER=$(Cluster) PROCESS=$(Process)"
 # Single-GPU tuning request for faster scheduling. The tuner runs trials
 # sequentially with FAST_GPUS_PER_TRIAL=1 and N_JOBS=1.
 request_GPUs = 1
-requirements = TARGET.CUDAGlobalMemoryMb >= 16000
 
-request_cpus = 8
-request_memory = 32 GB
+request_cpus = 4
+request_memory = 16 GB
 request_disk = 20 GB
 
 +JobFlavour = "workday"

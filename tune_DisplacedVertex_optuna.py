@@ -63,7 +63,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import optuna
+import optuna.logging
 import torch
+
+# ── notebook-friendly monitoring ───────────────────────────────────────────
+optuna.logging.set_verbosity(optuna.logging.INFO)   # show trial start/end events
+
+SEP  = "═" * 72
+SEP2 = "─" * 72
+
+def _log(*args, **kwargs):
+    """print + immediate flush so notebooks see output in real time."""
+    print(*args, **kwargs, flush=True)
+
+def _banner(title: str, char: str = "═") -> None:
+    line = char * 72
+    _log(f"\n{line}")
+    _log(f"  {title}")
+    _log(line)
 
 
 EPOCH_LINE_RE = re.compile(
@@ -454,23 +471,29 @@ def run_one_training(
     cwd: Path,
     env_extra: Optional[Dict[str, str]] = None,
     save_dir: Optional[Path] = None,
+    trial_label: str = "",
 ) -> int:
     env = os.environ.copy()
     if gpu_ids:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
     if env_extra:
         env.update(env_extra)
-        
+
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     env.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
     env.setdefault("NCCL_DEBUG", "WARN")
     env.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
     env.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    # Ensure subprocess output is unbuffered
+    env["PYTHONUNBUFFERED"] = "1"
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     shell_cmd = " ".join(shlex.quote(x) for x in cmd)
     if save_dir is not None:
         shell_cmd = f"mkdir -p {shlex.quote(str(Path(save_dir).expanduser().resolve()))} && exec {shell_cmd}"
+
+    _log(f"[run]  log → {log_path}")
+    _log(f"[run]  GPUs: {gpu_ids if gpu_ids else 'CPU'}")
 
     with log_path.open("w", encoding="utf-8") as log:
         log.write("[cmd] " + shell_cmd + "\n")
@@ -482,10 +505,21 @@ def run_one_training(
             text=True, bufsize=1,
         )
         assert proc.stdout is not None
+        last_epoch_summary = ""
         for line in proc.stdout:
-            print(line, end="")
+            # Always write to log file
             log.write(line)
-        return proc.wait()
+            log.flush()
+            stripped = line.rstrip()
+            # Print every line from the subprocess so notebook sees raw output
+            print(stripped, flush=True)
+            # Also print a clean highlighted summary for epoch lines
+            if stripped.startswith("[epoch"):
+                last_epoch_summary = stripped
+                # Re-print as a highlighted marker so it stands out in notebook
+                _log(f"  ▶ {trial_label} | {stripped}")
+        rc = proc.wait()
+    return rc
 
 
 def validate_inputs(args: argparse.Namespace) -> None:
@@ -680,20 +714,36 @@ def main() -> None:
     mkdir(ckpt_dir)
     mkdir(log_dir)
 
+    # Track best value seen so far for the running leaderboard
+    _best_so_far: Dict[str, Any] = {"value": None, "trial": None}
+
     def objective(trial: optuna.Trial) -> float:
         hparams = build_hparams(trial, args)
         run_id = f"trial{trial.number:05d}_{now_utc_compact()}"
         save_path = build_trial_ckpt_path(ckpt_dir, args.save, run_id)
         log_path = log_dir / f"{run_id}.log"
+        trial_label = f"Trial {trial.number}"
+
         if args.trial_launch_stagger_seconds > 0 and args.n_jobs > 1:
             time.sleep(float(args.trial_launch_stagger_seconds) * (trial.number % int(args.n_jobs)))
 
         master_port = pick_master_port(args.master_port_base, trial.number)
         rdzv_id = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', args.study_name)}_{run_id}"
 
+        # ── Trial start banner ────────────────────────────────────────────
+        _banner(f"TRIAL {trial.number} STARTED  [{datetime.now().strftime('%H:%M:%S')}]")
+        _log(f"  run_id : {run_id}")
+        _log(f"  epochs : {args.fast_epochs}")
+        _log(f"  objective: {args.compare_metric}")
+        _log(f"  Hyperparameters:")
+        for k, v in sorted(hparams.items()):
+            _log(f"    {k:<22} = {v}")
+        _log(SEP2)
 
         with allocator.acquire(args.fast_gpus_per_trial) as gpu_ids:
             nproc = torchrun_nproc(args.fast_gpus_per_trial, gpu_ids)
+
+            # ── Skip if checkpoint already exists ─────────────────────────
             if args.resume_skip_existing:
                 for candidate_ckpt in (save_path, legacy_duplicated_ckpt_path(save_path, run_id)):
                     if not candidate_ckpt.exists():
@@ -701,7 +751,9 @@ def main() -> None:
                     ckpt_info = read_ckpt_metrics(candidate_ckpt)
                     objective_value = extract_objective_from_ckpt(ckpt_info, args.compare_metric)
                     if objective_value is not None:
+                        _log(f"[skip] Trial {trial.number}: checkpoint exists → {args.compare_metric}={objective_value:.5f}")
                         return float(objective_value)
+
             cmd = build_command(
                 python_exe=os.environ.get("PYTHON", "python"),
                 train_script=train_script,
@@ -721,16 +773,24 @@ def main() -> None:
                 resume=False,
             )
             t0 = time.time()
-            rc = run_one_training(cmd=cmd, log_path=log_path, gpu_ids=gpu_ids, cwd=cwd, save_dir=ckpt_dir)
+            _log(f"[run]  Training subprocess launched...")
+            rc = run_one_training(
+                cmd=cmd, log_path=log_path, gpu_ids=gpu_ids,
+                cwd=cwd, save_dir=ckpt_dir, trial_label=trial_label,
+            )
             seconds = time.time() - t0
 
+        # ── Parse results ─────────────────────────────────────────────────
         parsed = parse_best_metrics_from_log(log_path, args.compare_metric)
         objective_value = parsed["objective_value"]
         if objective_value is None:
             for candidate_ckpt in (save_path, legacy_duplicated_ckpt_path(save_path, run_id)):
-                objective_value = extract_objective_from_ckpt(read_ckpt_metrics(candidate_ckpt), args.compare_metric)
+                objective_value = extract_objective_from_ckpt(
+                    read_ckpt_metrics(candidate_ckpt), args.compare_metric
+                )
                 if objective_value is not None:
                     break
+
         record = {
             "phase": "fast",
             "trial_number": trial.number,
@@ -750,8 +810,44 @@ def main() -> None:
         }
         append_jsonl(results_path, record)
 
+        # ── Trial complete banner ─────────────────────────────────────────
+        _banner(f"TRIAL {trial.number} FINISHED  [{datetime.now().strftime('%H:%M:%S')}]", char="─")
+        status = "✓ OK" if rc == 0 else f"✗ FAILED (rc={rc})"
+        _log(f"  status         : {status}")
+        _log(f"  elapsed        : {seconds/60:.1f} min ({seconds:.0f}s)")
+        _log(f"  epochs seen    : {parsed['n_epochs_seen']}")
+        _log(f"  {args.compare_metric:<20} = {objective_value if objective_value is not None else 'N/A'}")
+        if parsed.get("best_row"):
+            br = parsed["best_row"]
+            _log(f"  best epoch     : {br.get('epoch', '?')}")
+            for k in ("val_loss", "val_auc", "val_acc", "val_f1", "val_tpr_at_target_fpr", "val_fpr_at_target_fpr"):
+                v = br.get(k)
+                if v is not None:
+                    _log(f"    {k:<28} = {v:.5f}")
+
+        # ── Update and print running best-so-far leaderboard ─────────────
+        if objective_value is not None:
+            is_new_best = (
+                _best_so_far["value"] is None
+                or (
+                    direction == "maximize" and objective_value > _best_so_far["value"]
+                )
+                or (
+                    direction == "minimize" and objective_value < _best_so_far["value"]
+                )
+            )
+            if is_new_best:
+                _best_so_far["value"] = objective_value
+                _best_so_far["trial"] = trial.number
+                _log(f"  ★ NEW BEST! Trial {trial.number} → {args.compare_metric} = {objective_value:.5f}")
+            else:
+                _log(f"  ★ Best so far: Trial {_best_so_far['trial']} → {args.compare_metric} = {_best_so_far['value']:.5f}")
+        _log(SEP2)
+
         if rc != 0 or objective_value is None:
-            raise optuna.exceptions.TrialPruned(f"training failed or metric missing; rc={rc}, metric={objective_value}")
+            raise optuna.exceptions.TrialPruned(
+                f"training failed or metric missing; rc={rc}, metric={objective_value}"
+            )
         return float(objective_value)
 
     complete_trials = [
@@ -759,15 +855,16 @@ def main() -> None:
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
     if args.refit_only:
-        print("[mode] --refit-only set: skipping FAST Optuna optimization.", flush=True)
+        _log("[mode] --refit-only set: skipping FAST Optuna optimization.")
     else:
         if args.n_trials_extra:
             n_to_run = int(args.n_trials)
         else:
             n_to_run = max(0, int(args.n_trials) - len(complete_trials))
-        print(
-            f"[resume] completed_fast_trials={len(complete_trials)} requested_total={args.n_trials} launching={n_to_run}",
-            flush=True,
+        _banner(
+            f"OPTUNA SEARCH  |  completed={len(complete_trials)}  "
+            f"requested={args.n_trials}  launching={n_to_run}  "
+            f"objective={args.compare_metric}"
         )
         if n_to_run > 0:
             study.optimize(objective, n_trials=n_to_run, n_jobs=args.n_jobs, gc_after_trial=True)
@@ -776,11 +873,15 @@ def main() -> None:
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
+    _banner("OPTIMIZATION COMPLETE")
     if complete_trials:
-        print(f"[done] best trial: {study.best_trial.number} {args.compare_metric}={study.best_value}")
-        print(f"[done] best params: {study.best_trial.params}")
+        _log(f"  Best trial    : #{study.best_trial.number}")
+        _log(f"  {args.compare_metric:<20} = {study.best_value}")
+        _log(f"  Best params:")
+        for k, v in sorted(study.best_trial.params.items()):
+            _log(f"    {k:<28} = {v}")
     else:
-        print("[done] no completed trials in study; check the latest log files for training failures.")
+        _log("  No completed trials — check the latest log files for training failures.")
 
     if args.refit_top_k > 0 and complete_trials:
         trials = [t for t in study.trials if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE]
@@ -788,7 +889,7 @@ def main() -> None:
         trials.sort(key=lambda t: t.value, reverse=reverse)
         finalists = trials[: args.refit_top_k]
         refit_results = out_dir / "refit.jsonl"
-        print(f"[refit] refitting top {len(finalists)} trials")
+        _banner(f"REFIT PHASE  —  top {len(finalists)} trials  ({args.refit_epochs} epochs each)")
         for rank, t in enumerate(finalists, start=1):
             hparams = refit_hparams_from_trial(t, args)
             run_id = f"refit_rank{rank:02d}_trial{t.number:05d}_{now_utc_compact()}"
@@ -796,6 +897,15 @@ def main() -> None:
             log_path = log_dir / f"{run_id}.log"
             master_port = pick_master_port(args.master_port_base, 100000 + rank)
             rdzv_id = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', args.study_name)}_{run_id}"
+            trial_label = f"Refit rank {rank} (trial {t.number})"
+            _banner(
+                f"REFIT {rank}/{len(finalists)}  trial={t.number}  "
+                f"fast_score={t.value:.5f}  [{datetime.now().strftime('%H:%M:%S')}]",
+                char="─",
+            )
+            _log(f"  Hyperparameters:")
+            for k, v in sorted(hparams.items()):
+                _log(f"    {k:<22} = {v}")
             with allocator.acquire(args.refit_gpus_per_trial) as gpu_ids:
                 nproc = torchrun_nproc(args.refit_gpus_per_trial, gpu_ids)
                 cmd = build_command(
@@ -817,9 +927,14 @@ def main() -> None:
                     resume=False,
                 )
                 t0 = time.time()
-                rc = run_one_training(cmd=cmd, log_path=log_path, gpu_ids=gpu_ids, cwd=cwd, save_dir=ckpt_dir)
+                rc = run_one_training(
+                    cmd=cmd, log_path=log_path, gpu_ids=gpu_ids,
+                    cwd=cwd, save_dir=ckpt_dir, trial_label=trial_label,
+                )
                 seconds = time.time() - t0
             parsed = parse_best_metrics_from_log(log_path, args.compare_metric)
+            _log(f"  [refit {rank}] elapsed={seconds/60:.1f} min | "
+                 f"{args.compare_metric}={parsed['objective_value']}")
             append_jsonl(refit_results, {
                 "phase": "refit",
                 "rank": rank,
