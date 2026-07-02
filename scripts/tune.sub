@@ -7,19 +7,18 @@ output = scripts/condor_logs/tune.$(Cluster).$(Process).out
 error  = scripts/condor_logs/tune.$(Cluster).$(Process).err
 
 getenv = True
+should_transfer_files = NO
 
-# Adjust these paths for the batch filesystem if the submit directory is not
-# the repository root.
-environment = "REPO_DIR=$(SUBMIT_DIR) CLUSTER=$(Cluster) PROCESS=$(Process)"
+# Smoke-test defaults: keep the GPU request tiny so Condor has the best chance
+# to match the job. Override these values at submit time for larger studies.
+environment = "REPO_DIR=$(SUBMIT_DIR) CLUSTER=$(Cluster) PROCESS=$(Process) N_TRIALS=3 FAST_EPOCHS=2 FAST_MAX_TRAIN_EVENTS=1000 REFIT_TOP_K=0 NUM_WORKERS=1 FAST_GPUS_PER_TRIAL=1 N_JOBS=1 HEARTBEAT_INTERVAL=120"
 
-# Single-GPU tuning request for faster scheduling. The tuner runs trials
-# sequentially with FAST_GPUS_PER_TRIAL=1 and N_JOBS=1.
+# Single-GPU smoke test. Keep CPUs/RAM aligned with NUM_WORKERS=1.
 request_GPUs = 1
+request_cpus = 2
+request_memory = 8 GB
+request_disk = 5 GB
 
-request_cpus = 4
-request_memory = 16 GB
-request_disk = 20 GB
-
-+JobFlavour = "workday"
++JobFlavour = "microcentury"
 
 queue 1

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Condor launcher for GAT-residual Optuna tuning.
-# Override any of these from the submit file with environment variables if needed.
+# Defaults are intentionally small so the first job is a queue-friendly smoke
+# test. Override these from condor_submit or tune.sub for larger studies.
 
 REPO_DIR="${REPO_DIR:-$PWD}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-${REPO_DIR}/train_DisplacedVertex.py}"
@@ -12,19 +13,19 @@ DATA_GLOB="${DATA_GLOB:-${DATA_DIR}/*.h5}"
 SPLIT_FILE="${SPLIT_FILE:-${DATA_DIR}/split_displaced_vertex_seed12345.npz}"
 FEATURE_STATS_JSON="${FEATURE_STATS_JSON:-${DATA_DIR}/normalization_stats_raw.json}"
 
-OUT_DIR="${OUT_DIR:-/eos/user/y/yshresth/mounresult/tuning_dv_classifier_gat}"
-STUDY_NAME="${STUDY_NAME:-dv_classifier_gat}"
+OUT_DIR="${OUT_DIR:-/eos/user/y/yshresth/mounresult/tuning_dv_classifier_gat_smoke}"
+STUDY_NAME="${STUDY_NAME:-dv_classifier_gat_smoke}"
 
-N_TRIALS="${N_TRIALS:-30}"
-FAST_EPOCHS="${FAST_EPOCHS:-10}"
+N_TRIALS="${N_TRIALS:-3}"
+FAST_EPOCHS="${FAST_EPOCHS:-2}"
 FAST_GPUS_PER_TRIAL="${FAST_GPUS_PER_TRIAL:-1}"
 N_JOBS="${N_JOBS:-1}"
-FAST_MAX_TRAIN_EVENTS="${FAST_MAX_TRAIN_EVENTS:-5000}"
+FAST_MAX_TRAIN_EVENTS="${FAST_MAX_TRAIN_EVENTS:-1000}"
 REFIT_TOP_K="${REFIT_TOP_K:-0}"
 REFIT_EPOCHS="${REFIT_EPOCHS:-30}"
 REFIT_GPUS_PER_TRIAL="${REFIT_GPUS_PER_TRIAL:-1}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-300}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-120}"
 
 CONDOR_LOG_DIR="${CONDOR_LOG_DIR:-${REPO_DIR}/scripts/condor_logs}"
 
@@ -35,6 +36,9 @@ echo "[tune.sh] host=$(hostname)"
 echo "[tune.sh] cwd=$(pwd)"
 echo "[tune.sh] started_at=$(date -Is)"
 echo "[tune.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "[tune.sh] trials=${N_TRIALS} epochs=${FAST_EPOCHS} max_train_events=${FAST_MAX_TRAIN_EVENTS}"
+echo "[tune.sh] n_jobs=${N_JOBS} gpus_per_trial=${FAST_GPUS_PER_TRIAL} num_workers=${NUM_WORKERS}"
+echo "[tune.sh] out_dir=${OUT_DIR}"
 
 HEARTBEAT_PID=""
 (
