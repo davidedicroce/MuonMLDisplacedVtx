@@ -32,10 +32,23 @@ CONDOR_LOG_DIR="${CONDOR_LOG_DIR:-${REPO_DIR}/scripts/condor_logs}"
 cd "${REPO_DIR}"
 mkdir -p "${CONDOR_LOG_DIR}"
 
+if [ -n "${PYTHON:-}" ]; then
+  PYTHON_BIN="${PYTHON}"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "[tune.sh] ERROR: neither python3 nor python is available on PATH" >&2
+  exit 127
+fi
+export PYTHON="${PYTHON_BIN}"
+
 echo "[tune.sh] host=$(hostname)"
 echo "[tune.sh] cwd=$(pwd)"
 echo "[tune.sh] started_at=$(date -Is)"
 echo "[tune.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "[tune.sh] python=${PYTHON}"
 echo "[tune.sh] trials=${N_TRIALS} epochs=${FAST_EPOCHS} max_train_events=${FAST_MAX_TRAIN_EVENTS}"
 echo "[tune.sh] n_jobs=${N_JOBS} gpus_per_trial=${FAST_GPUS_PER_TRIAL} num_workers=${NUM_WORKERS}"
 echo "[tune.sh] out_dir=${OUT_DIR}"
@@ -55,7 +68,7 @@ HEARTBEAT_PID=""
 HEARTBEAT_PID="$!"
 trap 'if [ -n "${HEARTBEAT_PID}" ]; then kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true; fi' EXIT
 
-python -u "${REPO_DIR}/tune_DisplacedVertex_optuna.py" \
+"${PYTHON}" -u "${REPO_DIR}/tune_DisplacedVertex_optuna.py" \
   --train-script "${TRAIN_SCRIPT}" \
   --data-glob "${DATA_GLOB}" \
   --split-file "${SPLIT_FILE}" \

@@ -1,6 +1,8 @@
 universe = vanilla
 
-executable = scripts/tune.sh
+initialdir = $(SUBMIT_DIR)
+executable = /bin/bash
+arguments = $(SUBMIT_DIR)/scripts/tune.sh
 
 log    = scripts/condor_logs/tune.$(Cluster).log
 output = scripts/condor_logs/tune.$(Cluster).$(Process).out
