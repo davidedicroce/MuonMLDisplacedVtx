@@ -29,6 +29,11 @@ HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-120}"
 
 CONDOR_LOG_DIR="${CONDOR_LOG_DIR:-${REPO_DIR}/scripts/condor_logs}"
 
+if [ ! -f "${REPO_DIR}/tune_DisplacedVertex_optuna.py" ] && [ -f "${PWD}/tune_DisplacedVertex_optuna.py" ]; then
+  REPO_DIR="${PWD}"
+  TRAIN_SCRIPT="${REPO_DIR}/train_DisplacedVertex.py"
+fi
+
 cd "${REPO_DIR}"
 mkdir -p "${CONDOR_LOG_DIR}"
 

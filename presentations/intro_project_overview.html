@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Introduction and Project Overview</title>
+  <style>
+    :root {
+      --ink: #12202f;
+      --muted: #526173;
+      --line: #d8dee8;
+      --blue: #1f5eff;
+      --green: #1f8a70;
+      --paper: #f7f8fb;
+      --white: #ffffff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+
+    main {
+      width: 100vw;
+      height: 100vh;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scroll-snap-type: x mandatory;
+      display: flex;
+    }
+
+    section {
+      flex: 0 0 100vw;
+      height: 100vh;
+      scroll-snap-align: start;
+      padding: 6vh 7vw;
+      background: var(--white);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 4vh;
+      border-right: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      color: var(--blue);
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0.6rem 0 0;
+      font-size: clamp(2.8rem, 6vw, 5.8rem);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(2.4rem, 5vw, 4.8rem);
+      line-height: 1.06;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin-top: 1.25rem;
+      max-width: 900px;
+      color: var(--muted);
+      font-size: clamp(1.1rem, 1.7vw, 1.55rem);
+      line-height: 1.45;
+    }
+
+    .content {
+      align-self: center;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4vw;
+      align-items: start;
+    }
+
+    .panel {
+      border-top: 4px solid var(--blue);
+      padding-top: 1.2rem;
+    }
+
+    .panel.green { border-color: var(--green); }
+
+    .panel-title {
+      margin: 0 0 1rem;
+      font-size: clamp(1.2rem, 2vw, 1.8rem);
+      font-weight: 700;
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 1.2rem;
+      color: var(--muted);
+      font-size: clamp(1rem, 1.5vw, 1.36rem);
+      line-height: 1.55;
+    }
+
+    li { margin: 0.55rem 0; }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      color: var(--muted);
+      font-size: 0.98rem;
+      border-top: 1px solid var(--line);
+      padding-top: 1rem;
+    }
+
+    .tag {
+      display: inline-block;
+      color: var(--ink);
+      background: #eef3ff;
+      border: 1px solid #dbe5ff;
+      padding: 0.35rem 0.65rem;
+      margin-right: 0.4rem;
+      margin-top: 0.5rem;
+      border-radius: 4px;
+      font-size: 0.95rem;
+      font-weight: 700;
+    }
+
+    @media (max-width: 800px) {
+      section { padding: 4vh 6vw; overflow-y: auto; }
+      .content { grid-template-columns: 1fr; }
+      .footer { flex-direction: column; }
+    }
+
+    @media print {
+      body, main { width: auto; height: auto; overflow: visible; background: white; }
+      main { display: block; }
+      section {
+        width: 100vw;
+        height: 100vh;
+        page-break-after: always;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <header>
+        <div class="eyebrow">Introduction</div>
+        <h1>Yujal Shrestha</h1>
+        <p class="subtitle">
+          Computer engineering student from Nepal and CERN summer student, interested in applied
+          machine learning, computer vision, data visualization, and practical scientific software.
+        </p>
+      </header>
+
+      <div class="content">
+        <div class="panel">
+          <p class="panel-title">Background</p>
+          <ul>
+            <li>Bachelor in Computer Engineering, Pulchowk Engineering Campus.</li>
+            <li>Hands-on ML project experience across computer vision, generative models, OCR, and LLM-assisted systems.</li>
+            <li>Full-stack development experience helps me connect model outputs with usable analysis tools.</li>
+          </ul>
+        </div>
+
+        <div class="panel green">
+          <p class="panel-title">ML and Engineering Skills</p>
+          <ul>
+            <li>Python, PyTorch, Scikit-learn, Pandas, NumPy, and Matplotlib.</li>
+            <li>Built projects with GANs, YOLOv8, PaddleOCR, TensorFlow, and LLM integrations.</li>
+            <li>Comfortable connecting model development with clear evaluation and presentation.</li>
+          </ul>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <span>Summer Student Project</span>
+        <span>CERN / ATLAS Muon Spectrometer ML</span>
+      </footer>
+    </section>
+
+    <section>
+      <header>
+        <div class="eyebrow">Project Overview</div>
+        <h2>GNNs for Displaced Vertex Classification</h2>
+        <p class="subtitle">
+          The project studies graph neural networks for identifying displaced vertices in the ATLAS
+          muon spectrometer using event graphs built from muon segments and calorimeter towers.
+        </p>
+      </header>
+
+      <div class="content">
+        <div class="panel">
+          <p class="panel-title">Current Pipeline</p>
+          <ul>
+            <li>Convert ROOT files into HDF5 graph datasets.</li>
+            <li>Build nodes from muon segments and calorimeter towers.</li>
+            <li>Connect segment-tower pairs using geometric proximity and edge features.</li>
+            <li>Train graph-level binary classifiers for signal versus background.</li>
+          </ul>
+        </div>
+
+        <div class="panel green">
+          <p class="panel-title">My Focus</p>
+          <ul>
+            <li>Run Optuna tuning for the GAT residual architecture.</li>
+            <li>Compare GAT behavior against the edge residual baseline.</li>
+            <li>Study GAT-specific improvements such as attention heads, dropout, pooling, and edge-aware attention.</li>
+          </ul>
+          <div>
+            <span class="tag">GAT residual</span>
+            <span class="tag">Optuna</span>
+            <span class="tag">ATLAS DV</span>
+          </div>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <span>Goal: identify promising GAT settings and improvement directions</span>
+        <span>Metric focus: TPR at low FPR</span>
+      </footer>
+    </section>
+
+    <section>
+      <header>
+        <div class="eyebrow">Current Progress</div>
+        <h2>What I Have Done and What I Am Doing</h2>
+        <p class="subtitle">
+          I am getting familiar with the displaced-vertex ML pipeline, setting up queue-friendly
+          GAT tuning jobs, and studying architecture changes that could improve performance.
+        </p>
+      </header>
+
+      <div class="content">
+        <div class="panel">
+          <p class="panel-title">Done So Far</p>
+          <ul>
+            <li>Reviewed the current codebase and understood the ROOT to HDF5 to GNN training workflow.</li>
+            <li>Prepared small Optuna smoke-test jobs for CERN Condor GPU queues.</li>
+            <li>Debugged early batch issues around GPU matching, script launch, and Python selection.</li>
+          </ul>
+        </div>
+
+        <div class="panel green">
+          <p class="panel-title">Current Focus</p>
+          <ul>
+            <li>Run GAT residual Optuna tuning on small subsets before scaling to larger training runs.</li>
+            <li>Compare GAT residual performance against the supervisor's edge residual setup.</li>
+            <li>Investigate GAT improvements: attention heads, dropout, pooling, over-smoothing, and edge-aware attention.</li>
+          </ul>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <span>Near-term goal: complete a successful GAT smoke test</span>
+        <span>Next step: scale only after metrics and logs look sane</span>
+      </footer>
+    </section>
+  </main>
+</body>
+</html>

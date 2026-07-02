@@ -7,7 +7,7 @@ output = scripts/condor_logs/tune.$(Cluster).$(Process).out
 error  = scripts/condor_logs/tune.$(Cluster).$(Process).err
 
 getenv = True
-should_transfer_files = NO
+transfer_input_files = tune_DisplacedVertex_optuna.py, train_DisplacedVertex.py, dv_training_utils.py, dv_converter_utils.py
 
 # Smoke-test defaults: keep the GPU request tiny so Condor has the best chance
 # to match the job. Override these values at submit time for larger studies.

@@ -7,6 +7,7 @@ output = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).out
 error  = scripts/condor_logs/prepare_inputs.$(Cluster).$(Process).err
 
 getenv = True
+transfer_input_files = DisplacedVertex_splitter.py, DisplacedVertex_preproc.py, dv_converter_utils.py
 
 environment = "REPO_DIR=$(SUBMIT_DIR)"
 

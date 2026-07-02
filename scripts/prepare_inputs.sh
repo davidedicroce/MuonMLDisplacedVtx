@@ -13,6 +13,10 @@ VAL_FRACTION="${VAL_FRACTION:-0.1}"
 SEED="${SEED:-12345}"
 MAX_STATS_EVENTS="${MAX_STATS_EVENTS:--1}"
 
+if [ ! -f "${REPO_DIR}/DisplacedVertex_splitter.py" ] && [ -f "${PWD}/DisplacedVertex_splitter.py" ]; then
+  REPO_DIR="${PWD}"
+fi
+
 cd "${REPO_DIR}"
 
 echo "[prepare_inputs] repo=${REPO_DIR}"
