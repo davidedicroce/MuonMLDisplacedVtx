@@ -28,6 +28,7 @@ NUM_WORKERS="${NUM_WORKERS:-1}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-120}"
 
 CONDOR_LOG_DIR="${CONDOR_LOG_DIR:-${REPO_DIR}/scripts/condor_logs}"
+VENV_DIR="${VENV_DIR:-/eos/user/y/yshresth/venvs/mu2}"
 
 if [ ! -f "${REPO_DIR}/tune_DisplacedVertex_optuna.py" ] && [ -f "${PWD}/tune_DisplacedVertex_optuna.py" ]; then
   REPO_DIR="${PWD}"
@@ -37,7 +38,11 @@ fi
 cd "${REPO_DIR}"
 mkdir -p "${CONDOR_LOG_DIR}"
 
-if [ -n "${PYTHON:-}" ]; then
+if [ -n "${VENV_DIR}" ] && [ -f "${VENV_DIR}/bin/activate" ]; then
+  source "${VENV_DIR}/bin/activate"
+  PYTHON_BIN="${VENV_DIR}/bin/python"
+  echo "[tune.sh] activated venv=${VENV_DIR}"
+elif [ -n "${PYTHON:-}" ]; then
   PYTHON_BIN="${PYTHON}"
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN="$(command -v python3)"
