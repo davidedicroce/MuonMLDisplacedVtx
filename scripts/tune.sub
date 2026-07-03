@@ -19,6 +19,6 @@ request_cpus = 2
 request_memory = 8 GB
 request_disk = 5 GB
 
-+JobFlavour = "microcentury"
++JobFlavour = "workday"
 
 queue 1
