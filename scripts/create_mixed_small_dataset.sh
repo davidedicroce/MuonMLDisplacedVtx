@@ -6,6 +6,7 @@ set -euo pipefail
 #
 # Defaults are safe to override:
 #   SOURCE_DATA_DIR=/eos/user/y/yshresth/mudb
+#   SPLIT_FILE=/eos/user/y/yshresth/mudb/split_displaced_vertex_seed12345.npz
 #   SMALL_DATA_DIR=/eos/user/y/yshresth/mudb_small_mixed
 #   N_SIGNAL_FILES=10
 #   N_BACKGROUND_FILES=10
@@ -14,6 +15,7 @@ set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$PWD}"
 SOURCE_DATA_DIR="${SOURCE_DATA_DIR:-/eos/user/y/yshresth/mudb}"
+SPLIT_FILE="${SPLIT_FILE:-${SOURCE_DATA_DIR}/split_displaced_vertex_seed12345.npz}"
 SMALL_DATA_DIR="${SMALL_DATA_DIR:-/eos/user/y/yshresth/mudb_small_mixed}"
 N_SIGNAL_FILES="${N_SIGNAL_FILES:-10}"
 N_BACKGROUND_FILES="${N_BACKGROUND_FILES:-10}"
@@ -28,61 +30,60 @@ find "${SMALL_DATA_DIR}" -maxdepth 1 -type l -name '*.h5' -delete
 TMP_LIST="$(mktemp)"
 trap 'rm -f "${TMP_LIST}"' EXIT
 
-python - "${SOURCE_DATA_DIR}" "${N_SIGNAL_FILES}" "${N_BACKGROUND_FILES}" "${SEED}" > "${TMP_LIST}" <<'PY'
+python - "${SOURCE_DATA_DIR}" "${SPLIT_FILE}" "${N_SIGNAL_FILES}" "${N_BACKGROUND_FILES}" "${SEED}" > "${TMP_LIST}" <<'PY'
 import random
 import sys
 from pathlib import Path
 
-import h5py
 import numpy as np
 
 source = Path(sys.argv[1])
-n_sig = int(sys.argv[2])
-n_bkg = int(sys.argv[3])
-seed = int(sys.argv[4])
+split_file = Path(sys.argv[2])
+n_sig = int(sys.argv[3])
+n_bkg = int(sys.argv[4])
+seed = int(sys.argv[5])
 
 rng = random.Random(seed)
 signal = []
 background = []
 mixed = []
-unreadable = []
 
-def read_label(g):
-    if "y" in g:
-        y = g["y"][...]
-    elif "labels" in g:
-        y = g["labels"][...]
-    elif "label" in g.attrs:
-        y = np.asarray([g.attrs["label"]], dtype=np.float32)
-    else:
-        return None
-    y = np.asarray(y, dtype=np.float32).reshape(-1)
-    if y.size != 1:
-        return None
-    return float(y[0])
+if not split_file.exists():
+    print(f"ERROR: split file does not exist: {split_file}", file=sys.stderr)
+    sys.exit(2)
 
-for path in sorted(source.glob("*.h5")):
-    try:
-        n_pos = 0
-        n_neg = 0
-        with h5py.File(path, "r") as f:
-            if "events" not in f:
-                unreadable.append(path)
-                continue
-            for key in f["events"].keys():
-                y = read_label(f["events"][key])
-                if y == 1.0:
-                    n_pos += 1
-                elif y == 0.0:
-                    n_neg += 1
-        if n_pos > 0 and n_neg == 0:
-            signal.append(path)
-        elif n_neg > 0 and n_pos == 0:
-            background.append(path)
-        elif n_pos > 0 and n_neg > 0:
-            mixed.append(path)
-    except Exception:
-        unreadable.append(path)
+split = np.load(split_file, allow_pickle=True)
+required = {"h5_paths", "event_refs", "labels"}
+missing = sorted(required.difference(split.files))
+if missing:
+    print(f"ERROR: split file is missing required keys: {missing}", file=sys.stderr)
+    sys.exit(2)
+
+saved_paths = [Path(str(p)) for p in split["h5_paths"].tolist()]
+labels = np.asarray(split["labels"], dtype=np.float32).reshape(-1)
+event_refs = np.asarray(split["event_refs"], dtype=object)
+
+counts = {i: [0, 0] for i in range(len(saved_paths))}
+for ref, y in zip(event_refs, labels):
+    fi = int(ref[0])
+    if y == 1.0:
+        counts[fi][1] += 1
+    elif y == 0.0:
+        counts[fi][0] += 1
+
+for fi, (n_neg, n_pos) in counts.items():
+    saved = saved_paths[fi]
+    path = source / saved.name
+    if not path.exists():
+        path = saved
+    if not path.exists():
+        continue
+    if n_pos > 0 and n_neg == 0:
+        signal.append(path)
+    elif n_neg > 0 and n_pos == 0:
+        background.append(path)
+    elif n_pos > 0 and n_neg > 0:
+        mixed.append(path)
 
 rng.shuffle(signal)
 rng.shuffle(background)
