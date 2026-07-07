@@ -926,6 +926,11 @@ class H5EventDataset(Dataset):
     def __init__(
         self,
         h5_paths,
+        *,
+        event_refs: Optional[np.ndarray] = None,
+        labels: Optional[np.ndarray] = None,
+        dataset_names: Optional[np.ndarray] = None,
+        root_files: Optional[np.ndarray] = None,
     ):
         self.h5_paths = list(h5_paths)
 
@@ -933,28 +938,63 @@ class H5EventDataset(Dataset):
             raise ValueError("No H5 files provided.")
 
         self.index: List[Tuple[int, str]] = []
-        labels: List[float] = []
-        dataset_names: List[str] = []
-        root_files: List[str] = []
 
-        for fi, p in enumerate(self.h5_paths):
-            with h5py.File(p, "r") as f:
-                if "events" not in f:
-                    continue
-                for k in sorted(list(f["events"].keys())):
-                    g = f["events"][k]
-                    y_np = self._read_label_from_group(g, file_path=p, event_key=k)
-                    self.index.append((fi, k))
-                    labels.append(float(y_np.reshape(-1)[0]))
-                    dataset_names.append(_decode_attr_to_str(g.attrs.get("dataset_name", "unknown")))
-                    root_files.append(_decode_attr_to_str(g.attrs.get("root_file", "unknown")))
+        if event_refs is not None:
+            refs = np.asarray(event_refs, dtype=object)
+            for ref in refs:
+                if len(ref) != 2:
+                    raise ValueError(f"Expected event_ref=(file_idx, event_key), got {ref!r}")
+                fi = int(ref[0])
+                if fi < 0 or fi >= len(self.h5_paths):
+                    raise ValueError(f"Split event_ref file index {fi} is out of range for {len(self.h5_paths)} H5 files.")
+                self.index.append((fi, str(ref[1])))
+
+            if labels is None:
+                raise ValueError("labels must be provided when event_refs are used.")
+            labels_arr = np.asarray(labels, dtype=np.float32).reshape(-1)
+            if labels_arr.shape[0] != len(self.index):
+                raise ValueError(f"labels length {labels_arr.shape[0]} does not match event_refs length {len(self.index)}")
+
+            if dataset_names is None:
+                dataset_names_arr = np.asarray(["unknown"] * len(self.index), dtype=object)
+            else:
+                dataset_names_arr = np.asarray(dataset_names, dtype=object).reshape(-1)
+            if root_files is None:
+                root_files_arr = np.asarray(["unknown"] * len(self.index), dtype=object)
+            else:
+                root_files_arr = np.asarray(root_files, dtype=object).reshape(-1)
+
+            if dataset_names_arr.shape[0] != len(self.index):
+                raise ValueError("dataset_names length does not match event_refs length")
+            if root_files_arr.shape[0] != len(self.index):
+                raise ValueError("root_files length does not match event_refs length")
+        else:
+            labels_list: List[float] = []
+            dataset_names_list: List[str] = []
+            root_files_list: List[str] = []
+
+            for fi, p in enumerate(self.h5_paths):
+                with h5py.File(p, "r") as f:
+                    if "events" not in f:
+                        continue
+                    for k in sorted(list(f["events"].keys())):
+                        g = f["events"][k]
+                        y_np = self._read_label_from_group(g, file_path=p, event_key=k)
+                        self.index.append((fi, k))
+                        labels_list.append(float(y_np.reshape(-1)[0]))
+                        dataset_names_list.append(_decode_attr_to_str(g.attrs.get("dataset_name", "unknown")))
+                        root_files_list.append(_decode_attr_to_str(g.attrs.get("root_file", "unknown")))
+
+            labels_arr = np.asarray(labels_list, dtype=np.float32)
+            dataset_names_arr = np.asarray(dataset_names_list, dtype=object)
+            root_files_arr = np.asarray(root_files_list, dtype=object)
 
         if not self.index:
             raise ValueError("No events found in provided H5 files.")
 
-        self.labels_np = np.asarray(labels, dtype=np.float32)
-        self.dataset_names = np.asarray(dataset_names, dtype=object)
-        self.root_files = np.asarray(root_files, dtype=object)
+        self.labels_np = labels_arr
+        self.dataset_names = dataset_names_arr
+        self.root_files = root_files_arr
         self._files = None
         self._pid = None
 
@@ -1883,11 +1923,6 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                 flush=True,
             )
 
-    with timed_section("dataset_index", device=device, enabled=args.time) as tt:
-        ds = H5EventDataset(paths)
-    if ddp_is_main() and args.time:
-        print(f"[time] dataset indexing: {tt['seconds']:.3f}s", flush=True)
-
     split     = np.load(args.split_file, allow_pickle=True)
     train_idx = split["train_idx"].astype(np.int64)
     val_idx   = split["val_idx"].astype(np.int64)
@@ -1897,6 +1932,22 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         task = str(split["task"].tolist())
         if task not in ("graph_classification", "displaced_vertex_classification"):
             raise RuntimeError(f"Split file task={task!r} is not a classifier split.")
+
+    split_has_index = "event_refs" in split.files and "labels" in split.files
+    with timed_section("dataset_index", device=device, enabled=args.time) as tt:
+        if split_has_index:
+            ds = H5EventDataset(
+                paths,
+                event_refs=split["event_refs"],
+                labels=split["labels"],
+                dataset_names=split["dataset_names"] if "dataset_names" in split.files else None,
+                root_files=split["root_files"] if "root_files" in split.files else None,
+            )
+        else:
+            ds = H5EventDataset(paths)
+    if ddp_is_main() and args.time:
+        source = "split_file_event_refs" if split_has_index else "h5_scan"
+        print(f"[time] dataset indexing: {tt['seconds']:.3f}s ({source})", flush=True)
 
     n = len(ds)
     if train_idx.size == 0 or val_idx.size == 0:
