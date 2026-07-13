@@ -562,6 +562,8 @@ class CustomGAT(nn.Module):
         concat: bool = True,
         dropout: float = 0.0,
         add_self_loops: bool = True,
+        edge_dim: int = 0,
+        edge_attention: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -569,6 +571,8 @@ class CustomGAT(nn.Module):
         self.heads = heads
         self.concat = concat
         self.add_self_loops = add_self_loops
+        self.edge_dim = int(edge_dim or 0)
+        self.edge_attention = bool(edge_attention)
         self.dropout = nn.Dropout(dropout)
 
         self.linear = nn.Linear(in_channels, heads * out_channels, bias=False)
@@ -577,10 +581,29 @@ class CustomGAT(nn.Module):
         nn.init.xavier_uniform_(self.attn_l)
         nn.init.xavier_uniform_(self.attn_r)
 
+        if self.edge_attention:
+            if self.edge_dim <= 0:
+                raise ValueError("edge_dim must be positive when GAT edge attention is enabled")
+            edge_hidden = max(8, 2 * self.edge_dim)
+            self.edge_attn_encoder = nn.Sequential(
+                nn.LayerNorm(self.edge_dim),
+                nn.Linear(self.edge_dim, edge_hidden, bias=False),
+                nn.SiLU(),
+                nn.Linear(edge_hidden, heads, bias=False),
+            )
+        else:
+            self.edge_attn_encoder = None
+
         if not concat:
             self.out_proj = nn.Linear(heads * out_channels, out_channels, bias=False)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         num_nodes = x.size(0)
         x = self.linear(x).view(num_nodes, self.heads, self.out_channels)
         out_dtype = x.dtype
@@ -589,13 +612,37 @@ class CustomGAT(nn.Module):
         if self.add_self_loops:
             self_loops = torch.arange(num_nodes, device=x.device).unsqueeze(0).repeat(2, 1)
             edge_index = torch.cat([edge_index, self_loops], dim=1)
+            if self.edge_attention:
+                if edge_attr is None:
+                    raise RuntimeError("GAT edge attention requires edge_attr.")
+                loop_attr = torch.zeros(
+                    (num_nodes, edge_attr.shape[1]),
+                    device=edge_attr.device,
+                    dtype=edge_attr.dtype,
+                )
+                edge_attr = torch.cat([edge_attr, loop_attr], dim=0)
+
+        if self.edge_attention:
+            if edge_attr is None:
+                raise RuntimeError("GAT edge attention requires edge_attr.")
+            if edge_attr.shape[0] != edge_index.shape[1]:
+                raise RuntimeError(
+                    f"edge_attr rows ({edge_attr.shape[0]}) do not match edges ({edge_index.shape[1]})."
+                )
+            if edge_attr.shape[1] != self.edge_dim:
+                raise RuntimeError(
+                    f"edge_attr dim ({edge_attr.shape[1]}) does not match configured edge_dim ({self.edge_dim})."
+                )
 
         src = edge_index[0]
         dst = edge_index[1]
 
         alpha_l = (x_f[src] * self.attn_l).sum(dim=-1)
         alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
-        alpha = F.leaky_relu(alpha_l + alpha_r, negative_slope=0.2)
+        alpha_raw = alpha_l + alpha_r
+        if self.edge_attn_encoder is not None:
+            alpha_raw = alpha_raw + self.edge_attn_encoder(edge_attr.float())
+        alpha = F.leaky_relu(alpha_raw, negative_slope=0.2)
 
         alpha = torch.exp(alpha - alpha.max(dim=0, keepdim=True)[0])
         alpha_sum = torch.zeros((num_nodes, self.heads), device=x.device, dtype=torch.float32)
@@ -703,21 +750,36 @@ class EdgeResidualBlock(nn.Module):
 
 
 class GATResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, heads: int = 4, dropout: float = 0.2):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        heads: int = 4,
+        dropout: float = 0.2,
+        edge_dim: int = 0,
+        edge_attention: bool = False,
+    ):
         super().__init__()
         self.project = nn.Linear(in_channels, out_channels * heads) if in_channels != out_channels * heads else None
         self.gat = CustomGAT(
             in_channels=(out_channels * heads if self.project else in_channels),
             out_channels=out_channels,
             heads=heads, dropout=dropout, add_self_loops=True, concat=True,
+            edge_dim=edge_dim, edge_attention=edge_attention,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         if self.project is not None:
             x = self.project(x)
         identity = x
-        x = F.relu(self.gat(x, edge_index))
+        x = F.relu(self.gat(x, edge_index, edge_attr=edge_attr))
         x = self.dropout(x)
         return identity + x
 
@@ -832,6 +894,7 @@ class DisplacedVertexGNN(nn.Module):
         dropout=0.1,
         layer_type: str = "mpnn",
         gat_heads: int = 4,
+        gat_edge_attn: bool = False,
         sage_aggr: str = "mean",
         edgeconv_aggr: str = "mean",
         pool: str = "meanmax",
@@ -881,10 +944,13 @@ class DisplacedVertexGNN(nn.Module):
                 raise ValueError(f"hidden_dim={hdim} must be divisible by gat_heads={gat_heads}")
             per_head = hdim // gat_heads
             self.layers = nn.ModuleList([
-                GATResidualBlock(in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout)
+                GATResidualBlock(
+                    in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout,
+                    edge_dim=edim, edge_attention=gat_edge_attn,
+                )
                 for _ in range(n_layers)
             ])
-            self._uses_edge_attr = False
+            self._uses_edge_attr = bool(gat_edge_attn)
         else:
             raise ValueError(f"Unknown layer_type={layer_type}")
 
@@ -1096,6 +1162,7 @@ class DisplacedVertexGNN(nn.Module):
         dropout=0.1,
         layer_type: str = "mpnn",
         gat_heads: int = 4,
+        gat_edge_attn: bool = False,
         sage_aggr: str = "mean",
         edgeconv_aggr: str = "mean",
         pool: str = "meanmax",
@@ -1153,10 +1220,13 @@ class DisplacedVertexGNN(nn.Module):
                 raise ValueError(f"hidden_dim={hdim} must be divisible by gat_heads={gat_heads}")
             per_head = hdim // gat_heads
             self.layers = nn.ModuleList([
-                GATResidualBlock(in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout)
+                GATResidualBlock(
+                    in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout,
+                    edge_dim=edim, edge_attention=gat_edge_attn,
+                )
                 for _ in range(n_layers)
             ])
-            self._uses_edge_attr = False
+            self._uses_edge_attr = bool(gat_edge_attn)
         else:
             raise ValueError(f"Unknown layer_type={layer_type}")
 
@@ -1747,6 +1817,9 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--layer-type", default="mpnn",
                     choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"])
     ap.add_argument("--gat-heads", type=int, default=4)
+    ap.add_argument("--gat-edge-attn", action="store_true", default=False,
+                    help="Use edge_attr through a normalized edge encoder in GAT attention logits.")
+    ap.add_argument("--no-gat-edge-attn", dest="gat_edge_attn", action="store_false")
     ap.add_argument("--sage-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--edgeconv-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--pool", default="meanmax", choices=["mean", "max", "sum", "meanmax"])
@@ -2013,6 +2086,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     model = DisplacedVertexGNN(
         xdim=xdim, edim=edim, hdim=args.hidden_dim, n_layers=args.layers,
         dropout=args.dropout, layer_type=args.layer_type, gat_heads=args.gat_heads,
+        gat_edge_attn=args.gat_edge_attn,
         sage_aggr=args.sage_aggr, edgeconv_aggr=args.edgeconv_aggr, pool=args.pool,
         use_fourier=args.fourier, fourier_base=args.fourier_base,
         fourier_min_exp=args.fourier_min_exp, fourier_max_exp=args.fourier_max_exp,
@@ -2108,6 +2182,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                 "layers": args.layers,
                 "dropout": args.dropout,
                 "layer_type": args.layer_type,
+                "gat_edge_attn": args.gat_edge_attn,
                 "pool": args.pool,
                 "fourier": args.fourier,
                 "weight_decay": args.weight_decay,
@@ -2250,6 +2325,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                     "dropout": args.dropout,
                     "layer_type": args.layer_type,
                     "gat_heads": args.gat_heads,
+                    "gat_edge_attn": args.gat_edge_attn,
                     "sage_aggr": args.sage_aggr,
                     "edgeconv_aggr": args.edgeconv_aggr,
                     "pool": args.pool,

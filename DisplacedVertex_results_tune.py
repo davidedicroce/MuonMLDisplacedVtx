@@ -380,6 +380,7 @@ def build_displaced_vertex_model_from_checkpoint(
     dropout = float(_ckpt_get(ckpt, "dropout", 0.1))
     layer_type = str(_ckpt_get(ckpt, "layer_type", "mpnn"))
     gat_heads = int(_ckpt_get(ckpt, "gat_heads", 4))
+    gat_edge_attn = bool(_ckpt_get(ckpt, "gat_edge_attn", False))
     sage_aggr = str(_ckpt_get(ckpt, "sage_aggr", "mean"))
     edgeconv_aggr = str(_ckpt_get(ckpt, "edgeconv_aggr", "mean"))
     pool = str(_ckpt_get(ckpt, "pool", "meanmax"))
@@ -411,6 +412,7 @@ def build_displaced_vertex_model_from_checkpoint(
         dropout=dropout,
         layer_type=layer_type,
         gat_heads=gat_heads,
+        gat_edge_attn=gat_edge_attn,
         sage_aggr=sage_aggr,
         edgeconv_aggr=edgeconv_aggr,
         pool=pool,

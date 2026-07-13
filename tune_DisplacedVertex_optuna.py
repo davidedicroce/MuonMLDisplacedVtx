@@ -353,6 +353,7 @@ def build_hparams(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, An
             h["gat_heads"] = 4 if h["hidden_dim"] % 4 == 0 else 2
     else:
         h["gat_heads"] = 4
+    h["gat_edge_attn"] = bool(args.gat_edge_attn)
     _suggest_loss_hparams(trial, args, h)
     return h
 
@@ -372,6 +373,7 @@ def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Nam
         "fourier": args.fixed_fourier if args.fixed_fourier is not None else p.get("fourier", True),
         "pos_weight": args.fixed_pos_weight or p.get("pos_weight", "auto"),
         "gat_heads": p.get("gat_heads", 4),
+        "gat_edge_attn": bool(args.gat_edge_attn),
         "loss_type": args.fixed_loss_type or p.get("loss_type", args.loss_types[0]),
         "label_smoothing": p.get("label_smoothing", 0.0),
         "focal_gamma": p.get("focal_gamma", 2.0),
@@ -444,6 +446,10 @@ def build_command(
         "--wandb-mode", str(args.wandb_mode),
     ]
 
+    if bool(hparams.get("gat_edge_attn", False)):
+        cmd += ["--gat-edge-attn"]
+    else:
+        cmd += ["--no-gat-edge-attn"]
     if max_train_events > 0:
         cmd += ["--max-train-events", str(int(max_train_events))]
     if args.feature_stats_json:
@@ -690,6 +696,8 @@ def main() -> None:
     ap.add_argument("--asym-gamma-neg-min", type=float, default=1.0)
     ap.add_argument("--asym-gamma-neg-max", type=float, default=6.0)
     ap.add_argument("--fixed-layer-type", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"], default=None)
+    ap.add_argument("--gat-edge-attn", action="store_true", default=False,
+                    help="Enable edge_attr encoder in GAT attention logits for all GAT trials.")
     ap.add_argument("--fixed-pool", choices=["mean", "max", "sum", "meanmax"], default=None)
     ap.add_argument("--fixed-fourier", type=lambda s: s.lower() in ("1", "true", "yes", "y"), default=None)
     ap.add_argument("--fixed-pos-weight", default=None)
