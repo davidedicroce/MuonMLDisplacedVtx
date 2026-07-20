@@ -22,7 +22,7 @@ import faulthandler
 import atexit
 import signal
 from pathlib import Path
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,15 +30,14 @@ from typing import Any, Dict, List, Optional, Tuple
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 import h5py
-import numpy as np 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 try:
     import wandb
@@ -597,7 +596,23 @@ class CustomGAT(nn.Module):
         alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
         alpha = F.leaky_relu(alpha_l + alpha_r, negative_slope=0.2)
 
-        alpha = torch.exp(alpha - alpha.max(dim=0, keepdim=True)[0])
+        # Stable segment softmax: every destination node/head needs its own
+        # maximum. A single global maximum makes otherwise-disjoint graphs in
+        # a batch affect one another through floating-point underflow.
+        alpha_max = torch.full(
+            (num_nodes, self.heads),
+            -torch.inf,
+            device=x.device,
+            dtype=torch.float32,
+        )
+        alpha_max.scatter_reduce_(
+            0,
+            dst.unsqueeze(-1).expand_as(alpha),
+            alpha,
+            reduce="amax",
+            include_self=True,
+        )
+        alpha = torch.exp(alpha - alpha_max[dst])
         alpha_sum = torch.zeros((num_nodes, self.heads), device=x.device, dtype=torch.float32)
         alpha_sum.scatter_add_(0, dst.unsqueeze(-1).expand_as(alpha), alpha)
         alpha = alpha / alpha_sum[dst].clamp(min=1e-6)
@@ -822,6 +837,36 @@ def global_pool(h: torch.Tensor, mode: str = "meanmax") -> torch.Tensor:
         raise ValueError(f"Unknown pool mode: {mode}")
 
 
+def global_pool_batched(
+    h: torch.Tensor,
+    batch: Optional[torch.Tensor],
+    mode: str = "meanmax",
+) -> torch.Tensor:
+    """Pool a concatenated graph batch without requiring torch-geometric."""
+    if batch is None:
+        return global_pool(h, mode=mode)
+    batch = batch.to(device=h.device, dtype=torch.long).reshape(-1)
+    if batch.numel() != h.shape[0]:
+        raise ValueError(f"batch has {batch.numel()} entries for {h.shape[0]} nodes")
+    if batch.numel() == 0:
+        raise ValueError("Cannot pool an empty graph batch")
+    n_graphs = int(batch.max().item()) + 1
+    sums = h.new_zeros((n_graphs, h.shape[1]))
+    sums.index_add_(0, batch, h)
+    counts = h.new_zeros((n_graphs, 1))
+    counts.index_add_(0, batch, h.new_ones((h.shape[0], 1)))
+    means = sums / counts.clamp_min(1.0)
+    if mode == "sum":
+        return sums
+    if mode == "mean":
+        return means
+    if mode in ("max", "meanmax"):
+        maxima = h.new_full((n_graphs, h.shape[1]), -torch.inf)
+        maxima.scatter_reduce_(0, batch[:, None].expand(-1, h.shape[1]), h, reduce="amax", include_self=True)
+        return maxima if mode == "max" else torch.cat([means, maxima], dim=-1)
+    raise ValueError(f"Unknown pool mode: {mode}")
+
+
 class DisplacedVertexGNN(nn.Module):
     def __init__(
         self,
@@ -931,8 +976,10 @@ class H5EventDataset(Dataset):
         labels: Optional[np.ndarray] = None,
         dataset_names: Optional[np.ndarray] = None,
         root_files: Optional[np.ndarray] = None,
+        max_open_h5_files: int = 16,
     ):
         self.h5_paths = list(h5_paths)
+        self.max_open_h5_files = max(1, int(max_open_h5_files))
 
         if not self.h5_paths:
             raise ValueError("No H5 files provided.")
@@ -995,7 +1042,7 @@ class H5EventDataset(Dataset):
         self.labels_np = labels_arr
         self.dataset_names = dataset_names_arr
         self.root_files = root_files_arr
-        self._files = None
+        self._files = OrderedDict()
         self._pid = None
 
     @staticmethod
@@ -1022,33 +1069,39 @@ class H5EventDataset(Dataset):
         return len(self.index)
 
     def _close_files(self):
-        if self._files is None:
-            return
-        for f in self._files:
+        for f in self._files.values():
             try:
                 f.close()
             except Exception:
                 pass
-        self._files = None
+        self._files.clear()
 
-    def _ensure_open(self):
+    def _ensure_process(self):
         pid = os.getpid()
-        if self._files is not None and self._pid == pid:
+        if self._pid == pid:
             return
         self._close_files()
         self._pid = pid
-        self._files = [h5py.File(p, "r") for p in self.h5_paths]
         atexit.register(self._close_files)
+
+    def _get_file(self, fi: int):
+        self._ensure_process()
+        if fi in self._files:
+            self._files.move_to_end(fi)
+            return self._files[fi]
+        while len(self._files) >= self.max_open_h5_files:
+            _, old_file = self._files.popitem(last=False)
+            old_file.close()
+        f = h5py.File(self.h5_paths[fi], "r")
+        self._files[fi] = f
+        return f
 
     def get_label(self, idx: int) -> float:
         return float(self.labels_np[int(idx)])
 
     def __getitem__(self, idx):
-        self._ensure_open()
-        assert self._files is not None
-
         fi, k = self.index[idx]
-        f = self._files[fi]
+        f = self._get_file(fi)
         g = f["events"][k]
 
         x = torch.from_numpy(g["x"][...]).float()
@@ -1074,6 +1127,120 @@ class H5EventDataset(Dataset):
             "labels": y,
             "n_muon_nodes": n_muon_nodes,
         }
+
+
+def collate_graphs(items):
+    """Concatenate variable-size graphs and retain their graph membership."""
+    if not items:
+        raise ValueError("Cannot collate an empty batch")
+    xs, edges, edge_attrs, ys = [], [], [], []
+    graph_ids, mu_masks, n_muons = [], [], []
+    node_offset = 0
+    for graph_id, item in enumerate(items):
+        x = item["x"]
+        edge_index = item["edge_index"]
+        n_nodes = int(x.shape[0])
+        n_mu = int(item["n_muon_nodes"].item())
+        xs.append(x)
+        edges.append(edge_index + node_offset)
+        edge_attrs.append(item["edge_attr"])
+        ys.append(item["y"].reshape(-1))
+        graph_ids.append(torch.full((n_nodes,), graph_id, dtype=torch.long))
+        mu_masks.append(torch.arange(n_nodes, dtype=torch.long) < n_mu)
+        n_muons.append(item["n_muon_nodes"].reshape(()))
+        node_offset += n_nodes
+    y = torch.cat(ys, dim=0)
+    return {
+        "x": torch.cat(xs, dim=0),
+        "edge_index": torch.cat(edges, dim=1),
+        "edge_attr": torch.cat(edge_attrs, dim=0),
+        "y": y,
+        "labels": y,
+        "n_muon_nodes": torch.stack(n_muons),
+        "batch": torch.cat(graph_ids, dim=0),
+        "node_is_muon": torch.cat(mu_masks, dim=0),
+    }
+
+
+class FileLocalDistributedSampler(Sampler[int]):
+    """Shuffle at file granularity while giving each DDP rank different HDF5 files.
+
+    Dataset indices returned here are positions inside the Subset, not indices in
+    the underlying H5EventDataset. Training drops at most ``world_size - 1``
+    tail events so optimizer-step counts stay synchronized. Validation never
+    pads or truncates: every held-out event is emitted exactly once.
+    """
+
+    def __init__(
+        self,
+        dataset: H5EventDataset,
+        subset_indices: np.ndarray,
+        *,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool,
+        seed: int,
+        drop_last: bool,
+    ):
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        if self.num_replicas < 1 or not (0 <= self.rank < self.num_replicas):
+            raise ValueError(f"Invalid rank {self.rank} for {self.num_replicas} replicas")
+
+        base_indices = np.asarray(subset_indices, dtype=np.int64).reshape(-1)
+        file_ids = np.fromiter(
+            (dataset.index[int(i)][0] for i in base_indices),
+            dtype=np.int32,
+            count=base_indices.size,
+        )
+        positions = np.arange(base_indices.size, dtype=np.int64)
+        file_order = np.argsort(file_ids, kind="stable")
+        sorted_files = file_ids[file_order]
+        boundaries = np.flatnonzero(np.diff(sorted_files)) + 1
+        self.file_blocks = [x for x in np.split(positions[file_order], boundaries) if x.size]
+        self.n = int(base_indices.size)
+        if self.drop_last:
+            self.num_samples = self.n // self.num_replicas
+        else:
+            quotient, remainder = divmod(self.n, self.num_replicas)
+            self.num_samples = quotient + int(self.rank < remainder)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        block_order = np.arange(len(self.file_blocks))
+        if self.shuffle:
+            rng.shuffle(block_order)
+
+        ordered_blocks = []
+        for block_id in block_order:
+            block = self.file_blocks[int(block_id)]
+            if self.shuffle:
+                block = block.copy()
+                rng.shuffle(block)
+            ordered_blocks.append(block)
+
+        ordered = np.concatenate(ordered_blocks) if ordered_blocks else np.empty(0, dtype=np.int64)
+        if self.drop_last:
+            usable = (ordered.size // self.num_replicas) * self.num_replicas
+            ordered = ordered[:usable]
+            start = self.rank * self.num_samples
+            stop = start + self.num_samples
+        else:
+            quotient, remainder = divmod(ordered.size, self.num_replicas)
+            start = self.rank * quotient + min(self.rank, remainder)
+            stop = start + quotient + int(self.rank < remainder)
+        own = ordered[start:stop]
+        return iter(own.tolist())
 
 
 def _decode_attr_to_str(v) -> str:
@@ -1209,16 +1376,18 @@ class DisplacedVertexGNN(nn.Module):
         x: torch.Tensor,
         edge_attr: torch.Tensor,
         n_muon_nodes: Optional[Any],
+        node_is_muon: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.normalize_node_features:
-            if n_muon_nodes is None:
+            if n_muon_nodes is None and node_is_muon is None:
                 raise RuntimeError("Model-side node normalization requires n_muon_nodes.")
-            if not torch.is_tensor(n_muon_nodes):
-                n_muon_nodes = torch.tensor([n_muon_nodes], device=x.device, dtype=torch.long)
-            n_mu = n_muon_nodes.to(device=x.device, dtype=torch.long).reshape(-1)[0]
- 
-            node_ids = torch.arange(x.shape[0], device=x.device, dtype=torch.long)
-            mu_mask = (node_ids < n_mu).unsqueeze(-1)
+            if node_is_muon is None:
+                if not torch.is_tensor(n_muon_nodes):
+                    n_muon_nodes = torch.tensor([n_muon_nodes], device=x.device, dtype=torch.long)
+                n_mu = n_muon_nodes.to(device=x.device, dtype=torch.long).reshape(-1)[0]
+                node_ids = torch.arange(x.shape[0], device=x.device, dtype=torch.long)
+                node_is_muon = node_ids < n_mu
+            mu_mask = node_is_muon.to(device=x.device, dtype=torch.bool).reshape(-1, 1)
 
             x_mu = self._apply_feature_norm_torch(x, self.mu_center, self.mu_scale)
             x_ca = self._apply_feature_norm_torch(x, self.ca_center, self.ca_scale)
@@ -1236,10 +1405,12 @@ class DisplacedVertexGNN(nn.Module):
         edge_attr,
         *,
         n_muon_nodes: Optional[Any] = None,
+        batch: Optional[torch.Tensor] = None,
+        node_is_muon: Optional[torch.Tensor] = None,
         edge_dropout_p: float = 0.0,
         feature_noise_std: float = 0.0,
     ):
-        x, edge_attr = self._normalize_features(x, edge_attr, n_muon_nodes)
+        x, edge_attr = self._normalize_features(x, edge_attr, n_muon_nodes, node_is_muon)
 
         if self.training and feature_noise_std > 0:
             x = x + torch.randn_like(x) * float(feature_noise_std)
@@ -1254,7 +1425,7 @@ class DisplacedVertexGNN(nn.Module):
             else:
                 h = layer(h, edge_index)
 
-        g = global_pool(h, mode=self.pool)
+        g = global_pool_batched(h, batch=batch, mode=self.pool)
         return self.head(g).view(-1)
 
 
@@ -1572,6 +1743,11 @@ def _evaluate_classifier(
     edge_dropout_p: float = 0.0,
 ) -> Dict[str, float]:
     model.eval()
+    # Validation shards deliberately contain every event exactly once and can
+    # therefore differ in length by one. Bypass the DDP wrapper during forward
+    # passes so ranks with unequal final batch counts do not wait on DDP's
+    # forward-time collectives. Metrics are synchronized explicitly below.
+    eval_model = model.module if ddp_is_initialized() and hasattr(model, "module") else model
     total_loss = torch.tensor(0.0, device=device, dtype=torch.float64)
     total_n = torch.tensor(0.0, device=device, dtype=torch.float64)
     counts = torch.zeros(4, device=device, dtype=torch.float64)
@@ -1585,11 +1761,15 @@ def _evaluate_classifier(
         edge_index = batch["edge_index"].to(device, non_blocking=True).long()
         edge_attr = batch["edge_attr"].to(device, non_blocking=True).float()
         n_muon_nodes = batch["n_muon_nodes"].to(device, non_blocking=True).long()
+        graph_batch = batch["batch"].to(device, non_blocking=True).long()
+        node_is_muon = batch["node_is_muon"].to(device, non_blocking=True).bool()
         y = batch["y"].to(device, non_blocking=True).float().view(-1)
         with autocast_ctx:
-            logits = model(
+            logits = eval_model(
                 x, edge_index, edge_attr,
                 n_muon_nodes=n_muon_nodes,
+                batch=graph_batch,
+                node_is_muon=node_is_muon,
                 edge_dropout_p=edge_dropout_p,
             ).view_as(y)
             loss = criterion(logits, y)
@@ -1797,6 +1977,10 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--no-time", dest="time", action="store_false")
 
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="Graphs per optimizer step on each rank. Larger values reduce DDP synchronization overhead.")
+    ap.add_argument("--max-open-h5-files", type=int, default=16,
+                    help="Maximum HDF5 files kept open by each dataset process.")
     ap.add_argument("--pin-memory", action="store_true", default=True)
     ap.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
     ap.add_argument("--prefetch-factor", type=int, default=2)
@@ -1942,9 +2126,10 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                 labels=split["labels"],
                 dataset_names=split["dataset_names"] if "dataset_names" in split.files else None,
                 root_files=split["root_files"] if "root_files" in split.files else None,
+                max_open_h5_files=args.max_open_h5_files,
             )
         else:
-            ds = H5EventDataset(paths)
+            ds = H5EventDataset(paths, max_open_h5_files=args.max_open_h5_files)
     if ddp_is_main() and args.time:
         source = "split_file_event_refs" if split_has_index else "h5_scan"
         print(f"[time] dataset indexing: {tt['seconds']:.3f}s ({source})", flush=True)
@@ -1965,17 +2150,21 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     train_ds = torch.utils.data.Subset(ds, train_idx.tolist())
     val_ds = torch.utils.data.Subset(ds, val_idx.tolist())
 
-    train_sampler = DistributedSampler(
-        train_ds, num_replicas=ddp_world_size(), rank=ddp_rank(), shuffle=True, drop_last=True,
-    ) if ddp_is_initialized() else None
-    val_sampler = DistributedSampler(
-        val_ds, num_replicas=ddp_world_size(), rank=ddp_rank(), shuffle=False, drop_last=False,
-    ) if ddp_is_initialized() else None
+    train_sampler = FileLocalDistributedSampler(
+        ds, train_idx,
+        num_replicas=ddp_world_size(), rank=ddp_rank(),
+        shuffle=True, seed=args.seed, drop_last=ddp_is_initialized(),
+    )
+    val_sampler = FileLocalDistributedSampler(
+        ds, val_idx,
+        num_replicas=ddp_world_size(), rank=ddp_rank(),
+        shuffle=False, seed=args.seed, drop_last=False,
+    )
 
     pin_device = f"cuda:{int(os.environ.get('LOCAL_RANK','0'))}" if torch.cuda.is_available() else ""
     loader_kwargs = dict(
-        batch_size=1,
-        collate_fn=collate_one,
+        batch_size=args.batch_size,
+        collate_fn=collate_graphs,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         pin_memory_device=pin_device,
@@ -1986,7 +2175,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             persistent_workers=args.persistent_workers,
             prefetch_factor=args.prefetch_factor,
         )
-    train_loader = DataLoader(train_ds, shuffle=(train_sampler is None), sampler=train_sampler, **loader_kwargs)
+    train_loader = DataLoader(train_ds, shuffle=False, sampler=train_sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **loader_kwargs)
 
     if ddp_is_initialized() and len(train_loader) == 0:
@@ -2003,6 +2192,12 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             f"threshold={args.threshold} target_fpr={args.target_fpr}",
             flush=True,
         )
+        print(
+            f"[i] batch_size_per_rank={args.batch_size} effective_global_batch_size="
+            f"{args.batch_size * ddp_world_size()} max_open_h5_files={args.max_open_h5_files}",
+            flush=True,
+        )
+        print("[i] sampler=file_local (shuffled files; separate files assigned to DDP ranks)", flush=True)
 
     sample = next(iter(train_loader))
     xdim = sample["x"].shape[1]
@@ -2152,6 +2347,8 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             edge_index = batch["edge_index"].to(device, non_blocking=True).long()
             edge_attr = batch["edge_attr"].to(device, non_blocking=True).float()
             n_muon_nodes = batch["n_muon_nodes"].to(device, non_blocking=True).long()
+            graph_batch = batch["batch"].to(device, non_blocking=True).long()
+            node_is_muon = batch["node_is_muon"].to(device, non_blocking=True).bool()
             y = batch["y"].to(device, non_blocking=True).float().view(-1)
 
             opt.zero_grad(set_to_none=True)
@@ -2159,6 +2356,8 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                 logits = model(
                     x, edge_index, edge_attr,
                     n_muon_nodes=n_muon_nodes,
+                    batch=graph_batch,
+                    node_is_muon=node_is_muon,
                     edge_dropout_p=float(args.edge_dropout),
                     feature_noise_std=float(args.feat_noise_std),
                 ).view_as(y)

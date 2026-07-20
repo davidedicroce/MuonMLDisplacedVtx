@@ -1206,8 +1206,39 @@ def evaluate_onnx_model_on_files(
     # The patched H5EventDataset returns raw features.  Normalization is handled
     # by DisplacedVertexGNN/ONNX using n_muon_nodes, so inference must not
     # normalize x or edge_attr before feeding the model.
-    dataset = H5EventDataset([str(p) for p in input_paths])
+    # Reuse the pre-indexed event table stored in the split file. Scanning all
+    # HDF5 event groups here is extremely slow on EOS and duplicates work that
+    # was already completed when the split was created.
+    split = None
+    if args.split_file is not None:
+        split = np.load(Path(args.split_file).expanduser().resolve(), allow_pickle=True)
+    if split is not None and "event_refs" in split.files and "labels" in split.files:
+        dataset = H5EventDataset(
+            [str(p) for p in input_paths],
+            event_refs=split["event_refs"],
+            labels=split["labels"],
+            dataset_names=split["dataset_names"] if "dataset_names" in split.files else None,
+            root_files=split["root_files"] if "root_files" in split.files else None,
+            max_open_h5_files=16,
+        )
+        index_source = "split_file_event_refs"
+    else:
+        dataset = H5EventDataset([str(p) for p in input_paths], max_open_h5_files=16)
+        index_source = "h5_scan"
     eval_indices, split_meta = build_eval_indices(args, input_paths, dataset)
+
+    # Metric accumulation is order-independent. Group validation events by H5
+    # file so ONNX evaluation performs sustained reads instead of random EOS
+    # file opens while preserving the exact held-out event set.
+    if eval_indices.size:
+        eval_file_ids = np.fromiter(
+            (dataset.index[int(i)][0] for i in eval_indices),
+            dtype=np.int32,
+            count=eval_indices.size,
+        )
+        eval_indices = eval_indices[np.argsort(eval_file_ids, kind="stable")]
+    split_meta["dataset_index_source"] = index_source
+    split_meta["evaluation_order"] = "grouped_by_h5_file"
 
     sess = make_ort_session(
         onnx_path=onnx_path,
@@ -1222,7 +1253,8 @@ def evaluate_onnx_model_on_files(
     print(
         f"[eval] {Path(onnx_path).name}: evaluating {len(eval_indices)} events "
         f"from {len(input_paths)} file(s), split_key={args.split_key}, "
-        f"model_side_normalize_node={norm_node}, model_side_normalize_edge={norm_edge}",
+        f"index_source={index_source}, model_side_normalize_node={norm_node}, "
+        f"model_side_normalize_edge={norm_edge}",
         flush=True,
     )
 

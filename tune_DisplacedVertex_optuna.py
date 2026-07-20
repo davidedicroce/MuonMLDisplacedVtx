@@ -162,34 +162,45 @@ def is_better(metric: str, new: float, best: Optional[float]) -> bool:
 
 
 def parse_best_metrics_from_log(log_path: Path, compare_metric: str) -> Dict[str, Any]:
-    best_value = None
-    best_row: Dict[str, Any] = {}
-    last_row: Dict[str, Any] = {}
     if not log_path.exists():
         return {"objective_value": None, "best_row": {}, "last_row": {}, "n_epochs_seen": 0}
 
-    n_epochs = 0
-    with log_path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            m = EPOCH_LINE_RE.search(line.strip())
-            if not m:
-                continue
-            n_epochs += 1
-            row: Dict[str, Any] = {"epoch": int(m.group("epoch"))}
-            for key in METRICS:
-                row[key] = safe_float(m.groupdict().get(key))
-            last_row = row
-            value = row.get(compare_metric)
-            if value is not None and is_better(compare_metric, value, best_value):
-                best_value = value
-                best_row = row
-
-    return {
-        "objective_value": best_value,
-        "best_row": best_row,
-        "last_row": last_row,
-        "n_epochs_seen": n_epochs,
-    }
+    last_error: Optional[OSError] = None
+    for attempt in range(6):
+        best_value = None
+        best_row: Dict[str, Any] = {}
+        last_row: Dict[str, Any] = {}
+        n_epochs = 0
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = EPOCH_LINE_RE.search(line.strip())
+                    if not m:
+                        continue
+                    n_epochs += 1
+                    row: Dict[str, Any] = {"epoch": int(m.group("epoch"))}
+                    for key in METRICS:
+                        row[key] = safe_float(m.groupdict().get(key))
+                    last_row = row
+                    value = row.get(compare_metric)
+                    if value is not None and is_better(compare_metric, value, best_value):
+                        best_value = value
+                        best_row = row
+            return {
+                "objective_value": best_value,
+                "best_row": best_row,
+                "last_row": last_row,
+                "n_epochs_seen": n_epochs,
+            }
+        except OSError as exc:
+            last_error = exc
+            if attempt == 5:
+                break
+            delay = min(2 ** attempt, 16)
+            _log(f"[warn] EOS log read failed for {log_path}: {exc}; retrying in {delay}s")
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 def detect_gpus() -> List[str]:
@@ -403,7 +414,7 @@ def build_command(
 ) -> List[str]:
     if nproc > 0:
         cmd = [
-            "torchrun",
+            python_exe, "-m", "torch.distributed.run",
             "--standalone",
             f"--master_port={int(master_port)}",
             f"--nproc_per_node={int(nproc)}",
@@ -435,6 +446,8 @@ def build_command(
         "--asym-gamma-neg", str(hparams["asym_gamma_neg"]),
         "--target-fpr", str(args.target_fpr),
         "--num-workers", str(int(num_workers)),
+        "--batch-size", str(int(args.batch_size)),
+        "--max-open-h5-files", str(int(args.max_open_h5_files)),
         "--save", str(save_base),
         "--save-dir", str(save_path.parent),
         "--run-id", str(run_id),
@@ -642,6 +655,10 @@ def main() -> None:
     ap.add_argument("--refit-max-train-events", type=int, default=-1)
     ap.add_argument("--refit-gpus-per-trial", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="Graphs per GPU step passed to the trainer.")
+    ap.add_argument("--max-open-h5-files", type=int, default=16,
+                    help="Maximum HDF5 files open per trainer process.")
     ap.add_argument("--pin-memory", action="store_true", default=False)
     ap.add_argument("--wandb-mode", default="disabled", choices=["online", "offline", "disabled"])
     ap.add_argument("--feature-stats-json", default=None,
