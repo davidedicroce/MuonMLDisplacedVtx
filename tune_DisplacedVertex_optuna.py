@@ -638,7 +638,7 @@ def main() -> None:
     ap.add_argument("--sqlite-timeout", type=float, default=120.0, help="SQLite lock wait timeout in seconds.")
     ap.add_argument("--study-name", default="dv_classifier_tpr_fpr1")
     ap.add_argument("--compare-metric", default="val_tpr_at_target_fpr", choices=["val_loss", "val_auc", "val_acc", "val_f1", "val_balanced_acc", "val_tpr_at_target_fpr"])
-    ap.add_argument("--target-fpr", type=float, default=0.01, help="FPR working point. 0.01 means 1% FPR.")
+    ap.add_argument("--target-fpr", type=float, default=0.01, help="FPR working point. 0.01 means 1%% FPR.")
     ap.add_argument("--n-trials", type=int, default=50,
                     help="Total number of completed fast trials desired in the study. On resume, only the missing trials are launched.")
     ap.add_argument("--n-trials-extra", action="store_true", default=False,
@@ -717,6 +717,20 @@ def main() -> None:
     validate_inputs(args)
 
     devices = detect_gpus()
+    actual_cuda_devices = int(torch.cuda.device_count())
+    if devices and actual_cuda_devices < len(devices):
+        raise RuntimeError(
+            "CUDA_VISIBLE_DEVICES lists "
+            f"{len(devices)} device(s), but PyTorch can use only {actual_cuda_devices}. "
+            "Check for malformed, wrapped, unavailable, or duplicate GPU/MIG identifiers. "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
+        )
+    requested_gpus = max(int(args.fast_gpus_per_trial), int(args.refit_gpus_per_trial))
+    if devices and requested_gpus > actual_cuda_devices:
+        raise RuntimeError(
+            f"Requested up to {requested_gpus} GPU(s) per trial, but PyTorch can use only "
+            f"{actual_cuda_devices}."
+        )
     allocator = GPUAllocator(devices)
     print(f"[i] visible GPUs: {devices if devices else 'none; running train script without torchrun'}")
     print(f"[i] objective: {args.compare_metric}; target_fpr={args.target_fpr}")

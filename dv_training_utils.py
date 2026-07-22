@@ -579,11 +579,22 @@ class CustomGAT(nn.Module):
         if not concat:
             self.out_proj = nn.Linear(heads * out_channels, out_channels, bias=False)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         num_nodes = x.size(0)
         x = self.linear(x).view(num_nodes, self.heads, self.out_channels)
         out_dtype = x.dtype
         x_f = x.float()
+
+        if self.training and edge_dropout_p > 0.0 and edge_index.shape[1] > 0:
+            keep = torch.rand(edge_index.shape[1], device=edge_index.device) >= float(edge_dropout_p)
+            if not bool(keep.any()):
+                keep[torch.randint(0, edge_index.shape[1], (1,), device=edge_index.device)] = True
+            edge_index = edge_index[:, keep]
 
         if self.add_self_loops:
             self_loops = torch.arange(num_nodes, device=x.device).unsqueeze(0).repeat(2, 1)
@@ -728,11 +739,16 @@ class GATResidualBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         if self.project is not None:
             x = self.project(x)
         identity = x
-        x = F.relu(self.gat(x, edge_index))
+        x = F.relu(self.gat(x, edge_index, edge_dropout_p=edge_dropout_p))
         x = self.dropout(x)
         return identity + x
 
@@ -948,6 +964,8 @@ class DisplacedVertexGNN(nn.Module):
         for layer in self.layers:
             if self._uses_edge_attr:
                 h = layer(h, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
+            elif isinstance(layer, GATResidualBlock):
+                h = layer(h, edge_index, edge_dropout_p=edge_dropout_p)
             else:
                 h = layer(h, edge_index)
 
@@ -1422,6 +1440,8 @@ class DisplacedVertexGNN(nn.Module):
         for layer in self.layers:
             if self._uses_edge_attr:
                 h = layer(h, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
+            elif isinstance(layer, GATResidualBlock):
+                h = layer(h, edge_index, edge_dropout_p=edge_dropout_p)
             else:
                 h = layer(h, edge_index)
 
@@ -2161,14 +2181,14 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         shuffle=False, seed=args.seed, drop_last=False,
     )
 
-    pin_device = f"cuda:{int(os.environ.get('LOCAL_RANK','0'))}" if torch.cuda.is_available() else ""
     loader_kwargs = dict(
         batch_size=args.batch_size,
         collate_fn=collate_graphs,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        pin_memory_device=pin_device,
     )
+    if args.pin_memory and torch.cuda.is_available():
+        loader_kwargs["pin_memory_device"] = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     if args.num_workers > 0:
         loader_kwargs.update(
             multiprocessing_context=ctx,
