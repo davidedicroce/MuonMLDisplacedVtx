@@ -1,4 +1,9 @@
 *.pyc
+__pycache__/
+*.orig
+/code
+/scripts/condor_logs/
+/log_tune_*.txt
 .ipynb_checkpoints/
 .asetup.save
 athena/

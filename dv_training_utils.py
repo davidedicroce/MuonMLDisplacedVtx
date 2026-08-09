@@ -220,8 +220,8 @@ def ddp_setup():
                 f"CUDA_VISIBLE_DEVICES={cvd}"
             )
 
-        dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
 
 
 def ddp_cleanup():
