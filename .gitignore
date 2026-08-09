@@ -1,4 +1,7 @@
 *.pyc
+__pycache__/
+*.orig
+/code
 .ipynb_checkpoints/
 .asetup.save
 athena/

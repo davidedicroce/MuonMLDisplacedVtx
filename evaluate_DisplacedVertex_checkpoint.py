@@ -179,6 +179,7 @@ def build_model(ckpt_path: Path, args: argparse.Namespace) -> tuple[DisplacedVer
         layer_type=str(ckpt_get(ckpt, "layer_type", "mpnn")),
         gat_heads=int(ckpt_get(ckpt, "gat_heads", 4)),
         gat_edge_attn=bool(ckpt_get(ckpt, "gat_edge_attn", False)),
+        gatv2_edge_attn=bool(ckpt_get(ckpt, "gatv2_edge_attn", False)),
         sage_aggr=str(ckpt_get(ckpt, "sage_aggr", "mean")),
         edgeconv_aggr=str(ckpt_get(ckpt, "edgeconv_aggr", "mean")),
         pool=str(ckpt_get(ckpt, "pool", "meanmax")),
@@ -276,10 +277,12 @@ def main() -> None:
     model.to(device).eval()
     layer_type = ckpt_get(ckpt, "layer_type", "unknown")
     gat_edge_attn = ckpt_get(ckpt, "gat_edge_attn", False)
+    gatv2_edge_attn = ckpt_get(ckpt, "gatv2_edge_attn", False)
     print(
         "[model] "
         f"layer_type={layer_type} "
         f"gat_edge_attn={gat_edge_attn} "
+        f"gatv2_edge_attn={gatv2_edge_attn} "
         f"device={device}",
         flush=True,
     )

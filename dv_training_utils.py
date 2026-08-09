@@ -220,8 +220,8 @@ def ddp_setup():
                 f"CUDA_VISIBLE_DEVICES={cvd}"
             )
 
-        dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
 
 
 def ddp_cleanup():
@@ -563,6 +563,7 @@ class CustomGAT(nn.Module):
         add_self_loops: bool = True,
         edge_dim: int = 0,
         edge_attention: bool = False,
+        gatv2_edge_attention: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -572,13 +573,25 @@ class CustomGAT(nn.Module):
         self.add_self_loops = add_self_loops
         self.edge_dim = int(edge_dim or 0)
         self.edge_attention = bool(edge_attention)
+        self.gatv2_edge_attention = bool(gatv2_edge_attention)
+        if self.edge_attention and self.gatv2_edge_attention:
+            raise ValueError(
+                "GAT edge-bias attention and GATv2 source-destination-edge attention "
+                "are mutually exclusive."
+            )
         self.dropout = nn.Dropout(dropout)
 
         self.linear = nn.Linear(in_channels, heads * out_channels, bias=False)
-        self.attn_l = nn.Parameter(torch.empty(1, heads, out_channels))
-        self.attn_r = nn.Parameter(torch.empty(1, heads, out_channels))
-        nn.init.xavier_uniform_(self.attn_l)
-        nn.init.xavier_uniform_(self.attn_r)
+        if self.gatv2_edge_attention:
+            # These parameters belong to the baseline/edge-bias GAT scorer and
+            # would be unused in DDP for the GATv2 scorer.
+            self.register_parameter("attn_l", None)
+            self.register_parameter("attn_r", None)
+        else:
+            self.attn_l = nn.Parameter(torch.empty(1, heads, out_channels))
+            self.attn_r = nn.Parameter(torch.empty(1, heads, out_channels))
+            nn.init.xavier_uniform_(self.attn_l)
+            nn.init.xavier_uniform_(self.attn_r)
 
         if self.edge_attention:
             if self.edge_dim <= 0:
@@ -593,6 +606,61 @@ class CustomGAT(nn.Module):
         else:
             self.edge_attn_encoder = None
 
+        if self.gatv2_edge_attention:
+            if self.edge_dim <= 0:
+                raise ValueError(
+                    "edge_dim must be positive when GATv2 source-destination-edge "
+                    "attention is enabled"
+                )
+            # This is an Edge-GATv2-style attention MLP:
+            #
+            #   z_ij = W_src h_j + W_dst h_i + W_edge e_ij
+            #   score_ij = a^T SiLU(z_ij)
+            #
+            # The three separately projected terms are equivalent to one linear
+            # layer applied to concat([h_j, h_i, e_ij]), while avoiding a large
+            # explicitly materialized concatenation for every edge and head.
+            self.gatv2_attn_src = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_dst = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_edge = nn.Linear(
+                self.edge_dim, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_score = nn.Parameter(
+                torch.empty(1, heads, out_channels)
+            )
+            # Keep the value/message path independent from the attention path.
+            # Edge attributes therefore control both which neighbours matter
+            # and what vector each neighbour transmits:
+            #
+            #   m_ij = SiLU(V_src h_j + V_dst h_i + V_edge e_ij)
+            #
+            # Each projection is equivalent to one linear layer on
+            # concat([h_j, h_i, e_ij]), without explicitly materializing that
+            # large per-edge tensor.
+            self.gatv2_msg_dst = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_msg_edge = nn.Linear(
+                self.edge_dim, heads * out_channels, bias=False
+            )
+            nn.init.xavier_uniform_(self.gatv2_attn_src.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_dst.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_edge.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_score)
+            nn.init.xavier_uniform_(self.gatv2_msg_dst.weight)
+            nn.init.xavier_uniform_(self.gatv2_msg_edge.weight)
+        else:
+            self.gatv2_attn_src = None
+            self.gatv2_attn_dst = None
+            self.gatv2_attn_edge = None
+            self.register_parameter("gatv2_attn_score", None)
+            self.gatv2_msg_dst = None
+            self.gatv2_msg_edge = None
+
         if not concat:
             self.out_proj = nn.Linear(heads * out_channels, out_channels, bias=False)
 
@@ -604,16 +672,63 @@ class CustomGAT(nn.Module):
         edge_dropout_p: float = 0.0,
     ) -> torch.Tensor:
         num_nodes = x.size(0)
-        x = self.linear(x).view(num_nodes, self.heads, self.out_channels)
+        node_input = x
+        x = self.linear(node_input).view(num_nodes, self.heads, self.out_channels)
         out_dtype = x.dtype
         x_f = x.float()
+
+        if self.gatv2_edge_attention:
+            if (
+                self.gatv2_attn_src is None
+                or self.gatv2_attn_dst is None
+                or self.gatv2_attn_edge is None
+                or self.gatv2_attn_score is None
+                or self.gatv2_msg_dst is None
+                or self.gatv2_msg_edge is None
+            ):
+                raise RuntimeError(
+                    "GATv2 attention/message modules were not initialized."
+                )
+            gatv2_src_f = self.gatv2_attn_src(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+            gatv2_dst_f = self.gatv2_attn_dst(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+            gatv2_msg_dst_f = self.gatv2_msg_dst(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+        else:
+            gatv2_src_f = None
+            gatv2_dst_f = None
+            gatv2_msg_dst_f = None
+
+        if self.edge_attention or self.gatv2_edge_attention:
+            if edge_attr is None:
+                raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
+            if edge_attr.shape[0] != edge_index.shape[1]:
+                raise RuntimeError(
+                    f"edge_attr rows ({edge_attr.shape[0]}) do not match edges ({edge_index.shape[1]})."
+                )
+            if edge_attr.shape[1] != self.edge_dim:
+                raise RuntimeError(
+                    f"edge_attr dim ({edge_attr.shape[1]}) does not match configured edge_dim ({self.edge_dim})."
+                )
+
+        if self.training and edge_dropout_p > 0.0 and edge_index.shape[1] > 0:
+            keep = torch.rand(edge_index.shape[1], device=edge_index.device) >= float(edge_dropout_p)
+            if not bool(keep.any()):
+                keep[torch.randint(0, edge_index.shape[1], (1,), device=edge_index.device)] = True
+            edge_index = edge_index[:, keep]
+            if edge_attr is not None:
+                edge_attr = edge_attr[keep]
 
         if self.add_self_loops:
             self_loops = torch.arange(num_nodes, device=x.device).unsqueeze(0).repeat(2, 1)
             edge_index = torch.cat([edge_index, self_loops], dim=1)
-            if self.edge_attention:
+            if self.edge_attention or self.gatv2_edge_attention:
                 if edge_attr is None:
-                    raise RuntimeError("GAT edge attention requires edge_attr.")
+                    raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
                 loop_attr = torch.zeros(
                     (num_nodes, edge_attr.shape[1]),
                     device=edge_attr.device,
@@ -621,9 +736,9 @@ class CustomGAT(nn.Module):
                 )
                 edge_attr = torch.cat([edge_attr, loop_attr], dim=0)
 
-        if self.edge_attention:
+        if self.edge_attention or self.gatv2_edge_attention:
             if edge_attr is None:
-                raise RuntimeError("GAT edge attention requires edge_attr.")
+                raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
             if edge_attr.shape[0] != edge_index.shape[1]:
                 raise RuntimeError(
                     f"edge_attr rows ({edge_attr.shape[0]}) do not match edges ({edge_index.shape[1]})."
@@ -636,12 +751,42 @@ class CustomGAT(nn.Module):
         src = edge_index[0]
         dst = edge_index[1]
 
-        alpha_l = (x_f[src] * self.attn_l).sum(dim=-1)
-        alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
-        alpha_raw = alpha_l + alpha_r
-        if self.edge_attn_encoder is not None:
-            alpha_raw = alpha_raw + self.edge_attn_encoder(edge_attr.float())
-        alpha = F.leaky_relu(alpha_raw, negative_slope=0.2)
+        if self.gatv2_edge_attention:
+            if (
+                edge_attr is None
+                or gatv2_src_f is None
+                or gatv2_dst_f is None
+                or self.gatv2_attn_edge is None
+                or self.gatv2_attn_score is None
+                or gatv2_msg_dst_f is None
+                or self.gatv2_msg_edge is None
+            ):
+                raise RuntimeError(
+                    "GATv2 attention/message inputs are unavailable."
+                )
+            edge_f = self.gatv2_attn_edge(edge_attr.float()).view(
+                edge_attr.shape[0], self.heads, self.out_channels
+            ).float()
+            alpha_hidden = gatv2_src_f[src] + gatv2_dst_f[dst] + edge_f
+            alpha = (
+                F.silu(alpha_hidden) * self.gatv2_attn_score.float()
+            ).sum(dim=-1)
+            msg_edge_f = self.gatv2_msg_edge(edge_attr.float()).view(
+                edge_attr.shape[0], self.heads, self.out_channels
+            ).float()
+            messages = F.silu(
+                x_f[src] + gatv2_msg_dst_f[dst] + msg_edge_f
+            )
+        else:
+            if self.attn_l is None or self.attn_r is None:
+                raise RuntimeError("Baseline GAT attention parameters are unavailable.")
+            alpha_l = (x_f[src] * self.attn_l).sum(dim=-1)
+            alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
+            alpha_raw = alpha_l + alpha_r
+            if self.edge_attn_encoder is not None:
+                alpha_raw = alpha_raw + self.edge_attn_encoder(edge_attr.float())
+            alpha = F.leaky_relu(alpha_raw, negative_slope=0.2)
+            messages = x_f[src]
 
         # Stable segment softmax: every destination node/head needs its own
         # maximum. A single global maximum makes otherwise-disjoint graphs in
@@ -669,8 +814,8 @@ class CustomGAT(nn.Module):
         for h in range(self.heads):
             out[:, h].scatter_add_(
                 0,
-                dst.unsqueeze(-1).expand_as(x_f[src, h]),
-                alpha[:, h].unsqueeze(-1) * x_f[src, h],
+                dst.unsqueeze(-1).expand_as(messages[:, h]),
+                alpha[:, h].unsqueeze(-1) * messages[:, h],
             )
 
         if self.concat:
@@ -773,6 +918,7 @@ class GATResidualBlock(nn.Module):
         dropout: float = 0.2,
         edge_dim: int = 0,
         edge_attention: bool = False,
+        gatv2_edge_attention: bool = False,
     ):
         super().__init__()
         self.project = nn.Linear(in_channels, out_channels * heads) if in_channels != out_channels * heads else None
@@ -781,6 +927,7 @@ class GATResidualBlock(nn.Module):
             out_channels=out_channels,
             heads=heads, dropout=dropout, add_self_loops=True, concat=True,
             edge_dim=edge_dim, edge_attention=edge_attention,
+            gatv2_edge_attention=gatv2_edge_attention,
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -794,7 +941,14 @@ class GATResidualBlock(nn.Module):
         if self.project is not None:
             x = self.project(x)
         identity = x
-        x = F.relu(self.gat(x, edge_index, edge_attr=edge_attr))
+        x = F.relu(
+            self.gat(
+                x,
+                edge_index,
+                edge_attr=edge_attr,
+                edge_dropout_p=edge_dropout_p,
+            )
+        )
         x = self.dropout(x)
         return identity + x
 
@@ -940,6 +1094,7 @@ class DisplacedVertexGNN(nn.Module):
         layer_type: str = "mpnn",
         gat_heads: int = 4,
         gat_edge_attn: bool = False,
+        gatv2_edge_attn: bool = False,
         sage_aggr: str = "mean",
         edgeconv_aggr: str = "mean",
         pool: str = "meanmax",
@@ -983,6 +1138,10 @@ class DisplacedVertexGNN(nn.Module):
             ])
             self._uses_edge_attr = False
         elif layer_type == "gat_residual":
+            if gat_edge_attn and gatv2_edge_attn:
+                raise ValueError(
+                    "--gat-edge-attn and --gatv2-edge-attn are mutually exclusive"
+                )
             if gat_heads <= 0:
                 raise ValueError("--gat-heads must be >= 1")
             if hdim % gat_heads != 0:
@@ -992,10 +1151,11 @@ class DisplacedVertexGNN(nn.Module):
                 GATResidualBlock(
                     in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout,
                     edge_dim=edim, edge_attention=gat_edge_attn,
+                    gatv2_edge_attention=gatv2_edge_attn,
                 )
                 for _ in range(n_layers)
             ])
-            self._uses_edge_attr = bool(gat_edge_attn)
+            self._uses_edge_attr = bool(gat_edge_attn or gatv2_edge_attn)
         else:
             raise ValueError(f"Unknown layer_type={layer_type}")
 
@@ -1014,6 +1174,8 @@ class DisplacedVertexGNN(nn.Module):
         for layer in self.layers:
             if self._uses_edge_attr:
                 h = layer(h, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
+            elif isinstance(layer, GATResidualBlock):
+                h = layer(h, edge_index, edge_dropout_p=edge_dropout_p)
             else:
                 h = layer(h, edge_index)
 
@@ -1330,6 +1492,7 @@ class DisplacedVertexGNN(nn.Module):
         layer_type: str = "mpnn",
         gat_heads: int = 4,
         gat_edge_attn: bool = False,
+        gatv2_edge_attn: bool = False,
         sage_aggr: str = "mean",
         edgeconv_aggr: str = "mean",
         pool: str = "meanmax",
@@ -1381,6 +1544,10 @@ class DisplacedVertexGNN(nn.Module):
             ])
             self._uses_edge_attr = False
         elif layer_type == "gat_residual":
+            if gat_edge_attn and gatv2_edge_attn:
+                raise ValueError(
+                    "--gat-edge-attn and --gatv2-edge-attn are mutually exclusive"
+                )
             if gat_heads <= 0:
                 raise ValueError("--gat-heads must be >= 1")
             if hdim % gat_heads != 0:
@@ -1390,10 +1557,11 @@ class DisplacedVertexGNN(nn.Module):
                 GATResidualBlock(
                     in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout,
                     edge_dim=edim, edge_attention=gat_edge_attn,
+                    gatv2_edge_attention=gatv2_edge_attn,
                 )
                 for _ in range(n_layers)
             ])
-            self._uses_edge_attr = bool(gat_edge_attn)
+            self._uses_edge_attr = bool(gat_edge_attn or gatv2_edge_attn)
         else:
             raise ValueError(f"Unknown layer_type={layer_type}")
 
@@ -1492,6 +1660,8 @@ class DisplacedVertexGNN(nn.Module):
         for layer in self.layers:
             if self._uses_edge_attr:
                 h = layer(h, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
+            elif isinstance(layer, GATResidualBlock):
+                h = layer(h, edge_index, edge_dropout_p=edge_dropout_p)
             else:
                 h = layer(h, edge_index)
 
@@ -2000,6 +2170,22 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--gat-edge-attn", action="store_true", default=False,
                     help="Use edge_attr through a normalized edge encoder in GAT attention logits.")
     ap.add_argument("--no-gat-edge-attn", dest="gat_edge_attn", action="store_false")
+    ap.add_argument(
+        "--gatv2-edge-attn",
+        action="store_true",
+        default=False,
+        help=(
+            "Use nonlinear source-destination-edge GATv2 attention and "
+            "edge-conditioned messages: score=a^T SiLU(W_src h_src + "
+            "W_dst h_dst + W_edge e), message=SiLU(V_src h_src + "
+            "V_dst h_dst + V_edge e)."
+        ),
+    )
+    ap.add_argument(
+        "--no-gatv2-edge-attn",
+        dest="gatv2_edge_attn",
+        action="store_false",
+    )
     ap.add_argument("--sage-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--edgeconv-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--pool", default="meanmax", choices=["mean", "max", "sum", "meanmax"])
@@ -2113,6 +2299,16 @@ def _fmt_metric(v: float) -> str:
 
 
 def run_training(args, *, task_name: str = "displaced_vertex_classification"):
+    if args.gat_edge_attn and args.gatv2_edge_attn:
+        raise ValueError(
+            "--gat-edge-attn and --gatv2-edge-attn select different GAT "
+            "architectures and cannot be enabled together."
+        )
+    if (args.gat_edge_attn or args.gatv2_edge_attn) and args.layer_type != "gat_residual":
+        raise ValueError(
+            "Edge-aware GAT attention requires --layer-type gat_residual."
+        )
+
     try:
         faulthandler.enable(all_threads=True)
         faulthandler.register(signal.SIGBUS, all_threads=True, chain=True)
@@ -2234,14 +2430,14 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         shuffle=False, seed=args.seed, drop_last=False,
     )
 
-    pin_device = f"cuda:{int(os.environ.get('LOCAL_RANK','0'))}" if torch.cuda.is_available() else ""
     loader_kwargs = dict(
         batch_size=args.batch_size,
         collate_fn=collate_graphs,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        pin_memory_device=pin_device,
     )
+    if args.pin_memory and torch.cuda.is_available():
+        loader_kwargs["pin_memory_device"] = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     if args.num_workers > 0:
         loader_kwargs.update(
             multiprocessing_context=ctx,
@@ -2281,7 +2477,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     model = DisplacedVertexGNN(
         xdim=xdim, edim=edim, hdim=args.hidden_dim, n_layers=args.layers,
         dropout=args.dropout, layer_type=args.layer_type, gat_heads=args.gat_heads,
-        gat_edge_attn=args.gat_edge_attn,
+        gat_edge_attn=args.gat_edge_attn, gatv2_edge_attn=args.gatv2_edge_attn,
         sage_aggr=args.sage_aggr, edgeconv_aggr=args.edgeconv_aggr, pool=args.pool,
         use_fourier=args.fourier, fourier_base=args.fourier_base,
         fourier_min_exp=args.fourier_min_exp, fourier_max_exp=args.fourier_max_exp,
@@ -2378,6 +2574,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                 "dropout": args.dropout,
                 "layer_type": args.layer_type,
                 "gat_edge_attn": args.gat_edge_attn,
+                "gatv2_edge_attn": args.gatv2_edge_attn,
                 "pool": args.pool,
                 "fourier": args.fourier,
                 "weight_decay": args.weight_decay,
@@ -2525,6 +2722,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                     "layer_type": args.layer_type,
                     "gat_heads": args.gat_heads,
                     "gat_edge_attn": args.gat_edge_attn,
+                    "gatv2_edge_attn": args.gatv2_edge_attn,
                     "sage_aggr": args.sage_aggr,
                     "edgeconv_aggr": args.edgeconv_aggr,
                     "pool": args.pool,
