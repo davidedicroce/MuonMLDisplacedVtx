@@ -19,8 +19,8 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex.py \
     --feature-stats-json "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json" \
     --normalize-node-features \
     --normalize-edge-features \
-    --epochs 100 \
-    --lr 2e-4 \
+    --epochs 60 \
+    --lr 0.00034882957103492035 \
     --hidden-dim 128 \
     --layers 5 \
     --dropout 0.020720971979495448 \
@@ -34,10 +34,10 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex.py \
     --wandb-name "dv_binary_classifier" \
     --early-stop-monitor val_tpr_at_target_fpr \
     --pos-weight auto \
-    --fourier \
-    --weight-decay 0.01 \
-    --edge-dropout 0.05 \
-    --feat-noise-std 0.01 \
+    --no-fourier \
+    --weight-decay 2.8684229445023318e-06 \
+    --edge-dropout 0.033758773173194756 \
+    --feat-noise-std 0.0018684258382055787 \
     --ema \
     --ema-decay 0.999 \
     --save-dir "models" \

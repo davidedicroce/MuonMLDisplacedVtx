@@ -2158,8 +2158,8 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--split-file", required=True)
     ap.add_argument("--strict-split-check", action="store_true", default=False,
                     help="Require exact split-file path compatibility.")
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--lr", type=float, default=0.00034882957103492035)
     ap.add_argument("--hidden-dim", type=int, default=128)
     ap.add_argument("--layers", type=int, default=5)
     ap.add_argument("--dropout", type=float, default=0.020720971979495448)
@@ -2194,10 +2194,10 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="JSON file with precomputed node/edge feature normalization stats.")
     ap.add_argument("--feature-norm-kind", default="standard", choices=["standard", "robust"],
                     help="Which stats block to use from --feature-stats-json.")
-    ap.add_argument("--normalize-node-features", action="store_true", default=False,
+    ap.add_argument("--normalize-node-features", action="store_true", default=True,
                     help="Apply precomputed normalization to node features x.")
     ap.add_argument("--no-normalize-node-features", dest="normalize_node_features", action="store_false")
-    ap.add_argument("--normalize-edge-features", action="store_true", default=False,
+    ap.add_argument("--normalize-edge-features", action="store_true", default=True,
                     help="Apply precomputed normalization to edge_attr.")
     ap.add_argument("--no-normalize-edge-features", dest="normalize_edge_features", action="store_false")
     ap.add_argument("--feature-norm-clip", type=float, default=-1.0,
@@ -2205,14 +2205,14 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     ap.add_argument("--pos-weight", default="auto",
                     help="Positive-class weight: 'auto', 'none', or a positive float. Auto uses n_negative/n_positive in the train split.")
-    ap.add_argument("--loss-type", default="bce",
+    ap.add_argument("--loss-type", default="focal",
                     choices=["bce", "bce_smooth", "focal", "asymmetric_focal"],
                     help="Binary classification loss function.")
-    ap.add_argument("--label-smoothing", type=float, default=0.0,
+    ap.add_argument("--label-smoothing", type=float, default=0.013390460005485128,
                     help="Binary-label smoothing used by bce_smooth/focal/asymmetric_focal. 0 disables it.")
-    ap.add_argument("--focal-gamma", type=float, default=2.0,
+    ap.add_argument("--focal-gamma", type=float, default=0.6358567127518362,
                     help="Gamma for focal loss.")
-    ap.add_argument("--focal-alpha", default="none",
+    ap.add_argument("--focal-alpha", default="0.8839913658720648",
                     help="Optional positive-class alpha for focal/asymmetric_focal: 'none' or float in (0,1).")
     ap.add_argument("--asym-gamma-pos", type=float, default=0.0,
                     help="Positive-class gamma for asymmetric focal loss.")
@@ -2236,7 +2236,7 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--no-time", dest="time", action="store_false")
 
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--batch-size", type=int, default=16,
+    ap.add_argument("--batch-size", type=int, default=64,
                     help="Graphs per optimizer step on each rank. Larger values reduce DDP synchronization overhead.")
     ap.add_argument("--max-open-h5-files", type=int, default=16,
                     help="Maximum HDF5 files kept open by each dataset process.")
@@ -2261,7 +2261,7 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     ap.add_argument("--early-stop", dest="early_stop", action="store_true", default=True)
     ap.add_argument("--no-early-stop", dest="early_stop", action="store_false")
-    ap.add_argument("--early-stop-patience", type=int, default=25)
+    ap.add_argument("--early-stop-patience", type=int, default=20)
     ap.add_argument("--early-stop-min-delta", type=float, default=0.0)
     ap.add_argument("--early-stop-monitor", choices=["val_loss", "val_auc", "val_acc", "val_f1", "val_balanced_acc", "val_tpr_at_target_fpr"], default="val_tpr_at_target_fpr")
 
@@ -2275,18 +2275,18 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--reload-best-half-patience", dest="reload_best_half_patience",
                     action="store_true", default=False)
 
-    ap.add_argument("--fourier", dest="fourier", action="store_true", default=True)
+    ap.add_argument("--fourier", dest="fourier", action="store_true", default=False)
     ap.add_argument("--no-fourier", dest="fourier", action="store_false")
     ap.add_argument("--fourier-base", type=float, default=3.0)
     ap.add_argument("--fourier-min-exp", type=int, default=-6)
     ap.add_argument("--fourier-max-exp", type=int, default=6)
 
-    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--weight-decay", type=float, default=2.8684229445023318e-06)
     ap.add_argument("--no-decay-norm-bias", action="store_true", default=True)
     ap.add_argument("--decay-norm-bias", dest="no_decay_norm_bias", action="store_false")
 
-    ap.add_argument("--edge-dropout", type=float, default=0.0)
-    ap.add_argument("--feat-noise-std", type=float, default=0.0)
+    ap.add_argument("--edge-dropout", type=float, default=0.033758773173194756)
+    ap.add_argument("--feat-noise-std", type=float, default=0.0018684258382055787)
 
     ap.add_argument("--ema", action="store_true", default=True)
     ap.add_argument("--no-ema", dest="ema", action="store_false")
@@ -2364,7 +2364,24 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     feature_stats = None
     if args.normalize_node_features or args.normalize_edge_features:
         if args.feature_stats_json is None:
-            raise SystemExit("Feature normalization was requested but --feature-stats-json was not provided.")
+            default_stats = os.path.join(
+                os.path.dirname(os.path.abspath(args.split_file)),
+                "normalization_stats_raw.json",
+            )
+            if os.path.isfile(default_stats):
+                args.feature_stats_json = default_stats
+                if ddp_is_main():
+                    print(
+                        f"[i] using default feature stats beside split file: {default_stats}",
+                        flush=True,
+                    )
+            else:
+                raise SystemExit(
+                    "Feature normalization is enabled by default, but "
+                    f"{default_stats} was not found. Pass --feature-stats-json PATH "
+                    "or explicitly disable normalization with "
+                    "--no-normalize-node-features --no-normalize-edge-features."
+                )
         feature_stats = load_feature_stats_json(args.feature_stats_json, norm_kind=args.feature_norm_kind)
         if args.normalize_edge_features and not feature_stats["meta"]["has_edge_stats"]:
             raise SystemExit("Edge normalization requested, but the stats JSON does not contain edge stats.")
