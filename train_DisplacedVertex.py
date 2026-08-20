@@ -22,9 +22,11 @@ torchrun --standalone --nproc_per_node=8 train_DisplacedVertex.py \
     --epochs 100 \
     --lr 2e-4 \
     --hidden-dim 128 \
-    --layers 4 \
-    --dropout 0.1 \
-    --layer-type mpnn \
+    --layers 5 \
+    --dropout 0.020720971979495448 \
+    --layer-type gat_residual \
+    --gat-heads 2 \
+    --gatv2-edge-attn \
     --num-workers 4 \
     --pin-memory \
     --wandb \

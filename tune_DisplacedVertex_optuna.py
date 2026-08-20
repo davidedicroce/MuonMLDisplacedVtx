@@ -364,12 +364,17 @@ def build_hparams(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, An
             h["gat_heads"] = 4 if h["hidden_dim"] % 4 == 0 else 2
     else:
         h["gat_heads"] = 4
+    is_gat = h["layer_type"] == "gat_residual"
+    h["gat_edge_attn"] = bool(args.gat_edge_attn and is_gat)
+    h["gatv2_edge_attn"] = bool(args.gatv2_edge_attn and is_gat)
     _suggest_loss_hparams(trial, args, h)
     return h
 
 
 def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Namespace) -> Dict[str, Any]:
     p = dict(trial.params)
+    layer_type = args.fixed_layer_type or p.get("layer_type", "mpnn")
+    is_gat = layer_type == "gat_residual"
     h: Dict[str, Any] = {
         "lr": p.get("lr", args.lr_min),
         "hidden_dim": p.get("hidden_dim", args.hidden_dims[0]),
@@ -378,11 +383,13 @@ def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Nam
         "weight_decay": p.get("weight_decay", args.weight_decay_min),
         "edge_dropout": p.get("edge_dropout", args.edge_dropout_min),
         "feat_noise_std": p.get("feat_noise_std", args.feat_noise_min),
-        "layer_type": args.fixed_layer_type or p.get("layer_type", "mpnn"),
+        "layer_type": layer_type,
         "pool": args.fixed_pool or p.get("pool", "meanmax"),
         "fourier": args.fixed_fourier if args.fixed_fourier is not None else p.get("fourier", True),
         "pos_weight": args.fixed_pos_weight or p.get("pos_weight", "auto"),
         "gat_heads": p.get("gat_heads", 4),
+        "gat_edge_attn": bool(args.gat_edge_attn and is_gat),
+        "gatv2_edge_attn": bool(args.gatv2_edge_attn and is_gat),
         "loss_type": args.fixed_loss_type or p.get("loss_type", args.loss_types[0]),
         "label_smoothing": p.get("label_smoothing", 0.0),
         "focal_gamma": p.get("focal_gamma", 2.0),
@@ -457,6 +464,14 @@ def build_command(
         "--wandb-mode", str(args.wandb_mode),
     ]
 
+    if bool(hparams.get("gat_edge_attn", False)):
+        cmd += ["--gat-edge-attn"]
+    else:
+        cmd += ["--no-gat-edge-attn"]
+    if bool(hparams.get("gatv2_edge_attn", False)):
+        cmd += ["--gatv2-edge-attn"]
+    else:
+        cmd += ["--no-gatv2-edge-attn"]
     if max_train_events > 0:
         cmd += ["--max-train-events", str(int(max_train_events))]
     if args.feature_stats_json:
@@ -560,6 +575,19 @@ def validate_inputs(args: argparse.Namespace) -> None:
         )
     if args.feature_stats_json and not Path(args.feature_stats_json).exists():
         raise SystemExit(f"feature stats JSON does not exist: {args.feature_stats_json}")
+    if args.gat_edge_attn and args.gatv2_edge_attn:
+        raise SystemExit(
+            "--gat-edge-attn and --gatv2-edge-attn select different GAT "
+            "architectures and cannot be enabled together."
+        )
+    if (args.gat_edge_attn or args.gatv2_edge_attn) and args.fixed_layer_type not in (
+        None,
+        "gat_residual",
+    ):
+        raise SystemExit(
+            "Edge-aware GAT attention flags require --fixed-layer-type gat_residual "
+            "or an unfixed layer-type search."
+        )
 
 def build_optuna_storage(args: argparse.Namespace, out_dir: Path):
     """
@@ -707,6 +735,17 @@ def main() -> None:
     ap.add_argument("--asym-gamma-neg-min", type=float, default=1.0)
     ap.add_argument("--asym-gamma-neg-max", type=float, default=6.0)
     ap.add_argument("--fixed-layer-type", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"], default=None)
+    ap.add_argument("--gat-edge-attn", action="store_true", default=False,
+                    help="Enable edge_attr encoder in GAT attention logits for all GAT trials.")
+    ap.add_argument(
+        "--gatv2-edge-attn",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable nonlinear source-destination-edge GATv2 attention for all "
+            "GAT trials."
+        ),
+    )
     ap.add_argument("--fixed-pool", choices=["mean", "max", "sum", "meanmax"], default=None)
     ap.add_argument("--fixed-fourier", type=lambda s: s.lower() in ("1", "true", "yes", "y"), default=None)
     ap.add_argument("--fixed-pos-weight", default=None)

@@ -380,6 +380,8 @@ def build_displaced_vertex_model_from_checkpoint(
     dropout = float(_ckpt_get(ckpt, "dropout", 0.1))
     layer_type = str(_ckpt_get(ckpt, "layer_type", "mpnn"))
     gat_heads = int(_ckpt_get(ckpt, "gat_heads", 4))
+    gat_edge_attn = bool(_ckpt_get(ckpt, "gat_edge_attn", False))
+    gatv2_edge_attn = bool(_ckpt_get(ckpt, "gatv2_edge_attn", False))
     sage_aggr = str(_ckpt_get(ckpt, "sage_aggr", "mean"))
     edgeconv_aggr = str(_ckpt_get(ckpt, "edgeconv_aggr", "mean"))
     pool = str(_ckpt_get(ckpt, "pool", "meanmax"))
@@ -411,6 +413,8 @@ def build_displaced_vertex_model_from_checkpoint(
         dropout=dropout,
         layer_type=layer_type,
         gat_heads=gat_heads,
+        gat_edge_attn=gat_edge_attn,
+        gatv2_edge_attn=gatv2_edge_attn,
         sage_aggr=sage_aggr,
         edgeconv_aggr=edgeconv_aggr,
         pool=pool,
@@ -1123,7 +1127,21 @@ def build_eval_indices(args, input_paths: list[Path], dataset: H5EventDataset) -
     return idx, meta
 
 
-GENERIC_DATASET_SAMPLE_NAMES = {"", "unknown", "validation", "val", "valid", "train", "training", "test", "all", "displacedvtx", "displaced_vertex"}
+GENERIC_DATASET_SAMPLE_NAMES = {
+    "",
+    "unknown",
+    "validation",
+    "val",
+    "valid",
+    "train",
+    "training",
+    "test",
+    "all",
+    "displacedvtx",
+    "displaced_vertex",
+    "displacedvtx_mu200",
+    "displaced_vertex_mu200",
+}
 
 
 def _is_generic_dataset_name(name: str) -> bool:
@@ -1364,7 +1382,8 @@ def plot_entry_has_samples(entry: dict | None, sample_names: Iterable[str]) -> b
 def metadata_from_checkpoint(item: LoadedCheckpoint, args, feature_metadata: dict, export_info: dict, eval_meta: dict | None = None) -> dict:
     keys = [
         "task", "model_type", "xdim", "edim", "hidden_dim", "layers", "dropout", "layer_type",
-        "gat_heads", "sage_aggr", "edgeconv_aggr", "pool", "fourier", "fourier_base",
+        "gat_heads", "gat_edge_attn", "gatv2_edge_attn", "sage_aggr", "edgeconv_aggr",
+        "pool", "fourier", "fourier_base",
         "fourier_min_exp", "fourier_max_exp", "lr", "weight_decay", "edge_dropout",
         "feat_noise_std", "loss_type", "threshold", "target_fpr", "best_monitor",
         "early_stop_monitor", "best_ckpt_epoch", "run_id", "epoch", "ema", "ema_decay",
@@ -1735,6 +1754,10 @@ def main():
             **feature_metadata,
             "task": "displaced_vertex_classification",
             "model_type": str(_ckpt_get(item.ckpt, "model_type", "binary_graph_classifier")),
+            "layer_type": str(_ckpt_get(item.ckpt, "layer_type", "mpnn")),
+            "gat_heads": int(_ckpt_get(item.ckpt, "gat_heads", 4)),
+            "gat_edge_attn": bool(_ckpt_get(item.ckpt, "gat_edge_attn", False)),
+            "gatv2_edge_attn": bool(_ckpt_get(item.ckpt, "gatv2_edge_attn", False)),
             "normalize_node_features": bool(norm_node),
             "normalize_edge_features": bool(norm_edge),
             "feature_stats_json": str(stats_json) if stats_json is not None else "",
