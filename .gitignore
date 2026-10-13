@@ -33,3 +33,7 @@ wandb/
 *save
 *new
 *old
+*.txt
+feynman_*
+onnx_eval_*
+tuning_dv_*
