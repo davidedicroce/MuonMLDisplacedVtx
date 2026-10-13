@@ -29,3 +29,6 @@ wandb/
 *save
 *new
 *old
+feynman*
+onnx_eval_*
+tuning_dv_*

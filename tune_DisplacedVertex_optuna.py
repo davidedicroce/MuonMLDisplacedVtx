@@ -240,6 +240,12 @@ def build_trial_ckpt_path(ckpt_dir: Path, save_base: str, run_id: str) -> Path:
     return Path(ckpt_dir) / f"{stem}_{run_id}{ext}"
 
 
+def build_recovery_ckpt_path(best_path: Path) -> Path:
+    """Mirror dv_training_utils._build_recovery_path(...)."""
+    suffix = best_path.suffix if best_path.suffix else ".pt"
+    return best_path.with_name(f"{best_path.stem}.last{suffix}")
+
+
 def legacy_duplicated_ckpt_path(save_path: Path, run_id: str) -> Path:
     """Path produced by the pre-patch tuner, which passed a run-id-expanded --save."""
     save_path = Path(save_path)
@@ -267,13 +273,14 @@ def read_ckpt_metrics(ckpt_path: Path) -> Dict[str, Any]:
 
 
 def extract_objective_from_ckpt(ckpt_info: Dict[str, Any], compare_metric: str) -> Optional[float]:
-    v = safe_float(ckpt_info.get(compare_metric))
-    if v is not None:
-        return v
-    # Older checkpoints only stored the monitored objective as best_monitor.
+    # Recovery checkpoints contain the *current* epoch's validation values and
+    # the best monitored value seen so far.  Prefer the latter when it is the
+    # requested objective so an interrupted run is not ranked by its last epoch.
     if ckpt_info.get("early_stop_monitor") == compare_metric:
-        return safe_float(ckpt_info.get("best_monitor"))
-    return None
+        best = safe_float(ckpt_info.get("best_monitor"))
+        if best is not None:
+            return best
+    return safe_float(ckpt_info.get(compare_metric))
 
 
 def _suggest_loss_hparams(trial: optuna.Trial, args: argparse.Namespace, h: Dict[str, Any]) -> None:
@@ -454,6 +461,7 @@ def run_one_training(
     cwd: Path,
     env_extra: Optional[Dict[str, str]] = None,
     save_dir: Optional[Path] = None,
+    append_log: bool = False,
 ) -> int:
     env = os.environ.copy()
     if gpu_ids:
@@ -472,7 +480,7 @@ def run_one_training(
     if save_dir is not None:
         shell_cmd = f"mkdir -p {shlex.quote(str(Path(save_dir).expanduser().resolve()))} && exec {shell_cmd}"
 
-    with log_path.open("w", encoding="utf-8") as log:
+    with log_path.open("a" if append_log else "w", encoding="utf-8") as log:
         log.write("[cmd] " + shell_cmd + "\n")
         log.flush()
         proc = subprocess.Popen(
@@ -581,7 +589,7 @@ def main() -> None:
     ap.add_argument("--sqlite-timeout", type=float, default=120.0, help="SQLite lock wait timeout in seconds.")
     ap.add_argument("--study-name", default="dv_classifier_tpr_fpr1")
     ap.add_argument("--compare-metric", default="val_tpr_at_target_fpr", choices=["val_loss", "val_auc", "val_acc", "val_f1", "val_balanced_acc", "val_tpr_at_target_fpr"])
-    ap.add_argument("--target-fpr", type=float, default=0.01, help="FPR working point. 0.01 means 1% FPR.")
+    ap.add_argument("--target-fpr", type=float, default=0.01, help="FPR working point. 0.01 means 1%% FPR.")
     ap.add_argument("--n-trials", type=int, default=50,
                     help="Total number of completed fast trials desired in the study. On resume, only the missing trials are launched.")
     ap.add_argument("--n-trials-extra", action="store_true", default=False,
@@ -597,6 +605,11 @@ def main() -> None:
     ap.add_argument("--refit-epochs", type=int, default=100)
     ap.add_argument("--refit-max-train-events", type=int, default=-1)
     ap.add_argument("--refit-gpus-per-trial", type=int, default=1)
+    ap.add_argument("--refit-run-tag", default="default",
+                    help="Stable tag for refit checkpoint names. Reuse the same tag to resume an interrupted refit.")
+    ap.add_argument("--refit-resume", dest="refit_resume", action="store_true", default=True,
+                    help="Resume refits from their .last recovery checkpoint when present.")
+    ap.add_argument("--no-refit-resume", dest="refit_resume", action="store_false")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--pin-memory", action="store_true", default=False)
     ap.add_argument("--wandb-mode", default="disabled", choices=["online", "offline", "disabled"])
@@ -791,8 +804,10 @@ def main() -> None:
         print(f"[refit] refitting top {len(finalists)} trials")
         for rank, t in enumerate(finalists, start=1):
             hparams = refit_hparams_from_trial(t, args)
-            run_id = f"refit_rank{rank:02d}_trial{t.number:05d}_{now_utc_compact()}"
+            safe_tag = re.sub(r"[^A-Za-z0-9_.-]", "_", str(args.refit_run_tag)).strip("._-") or "default"
+            run_id = f"refit_{safe_tag}_rank{rank:02d}_trial{t.number:05d}"
             save_path = build_trial_ckpt_path(ckpt_dir, args.save, run_id)
+            recovery_path = build_recovery_ckpt_path(save_path)
             log_path = log_dir / f"{run_id}.log"
             master_port = pick_master_port(args.master_port_base, 100000 + rank)
             rdzv_id = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', args.study_name)}_{run_id}"
@@ -814,12 +829,25 @@ def main() -> None:
                     nproc=nproc,
                     master_port=master_port,
                     rdzv_id=rdzv_id,
-                    resume=False,
+                    resume=bool(args.refit_resume),
                 )
                 t0 = time.time()
-                rc = run_one_training(cmd=cmd, log_path=log_path, gpu_ids=gpu_ids, cwd=cwd, save_dir=ckpt_dir)
+                rc = run_one_training(
+                    cmd=cmd,
+                    log_path=log_path,
+                    gpu_ids=gpu_ids,
+                    cwd=cwd,
+                    save_dir=ckpt_dir,
+                    append_log=bool(args.refit_resume and (log_path.exists() or recovery_path.exists())),
+                )
                 seconds = time.time() - t0
             parsed = parse_best_metrics_from_log(log_path, args.compare_metric)
+            objective_value = parsed["objective_value"]
+            if objective_value is None:
+                for candidate_ckpt in (save_path, recovery_path, legacy_duplicated_ckpt_path(save_path, run_id)):
+                    objective_value = extract_objective_from_ckpt(read_ckpt_metrics(candidate_ckpt), args.compare_metric)
+                    if objective_value is not None:
+                        break
             append_jsonl(refit_results, {
                 "phase": "refit",
                 "rank": rank,
@@ -828,12 +856,13 @@ def main() -> None:
                 "returncode": rc,
                 "seconds": seconds,
                 "objective_name": args.compare_metric,
-                "objective_value": parsed["objective_value"],
+                "objective_value": objective_value,
                 "target_fpr": args.target_fpr,
                 "best_row": parsed["best_row"],
                 "last_row": parsed["last_row"],
                 "hparams": hparams,
                 "ckpt_path": str(save_path),
+                "recovery_ckpt_path": str(recovery_path),
                 "log_path": str(log_path),
             })
 

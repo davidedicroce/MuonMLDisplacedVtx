@@ -18,11 +18,13 @@ import glob
 import os
 import random
 import time
+import shutil
+import resource
 import faulthandler
 import atexit
 import signal
 from pathlib import Path
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -109,6 +111,21 @@ def _build_save_path(args, run_id: str) -> str:
         os.makedirs(args.save_dir, exist_ok=True)
         return os.path.join(args.save_dir, f"{stem}_{run_id}{ext}")
     return os.path.join(os.path.dirname(args.save) or ".", f"{stem}_{run_id}{ext}")
+
+
+def _build_recovery_path(best_path: str) -> str:
+    """Return the separate atomic checkpoint used for exact optimizer resume."""
+    p = Path(best_path)
+    suffix = p.suffix if p.suffix else ".pt"
+    return str(p.with_name(f"{p.stem}.last{suffix}"))
+
+
+def _snapshot_state_dict_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Make an independent CPU snapshot suitable for a durable checkpoint."""
+    out: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        out[key] = value.detach().cpu().clone() if torch.is_tensor(value) else value
+    return out
 
 
 def _normalize_path_str(p: str) -> str:
@@ -239,6 +256,120 @@ def ddp_all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
 def ddp_barrier():
     if ddp_is_initialized():
         dist.barrier()
+
+
+def _bytes_gib(n_bytes: int) -> float:
+    return float(n_bytes) / (1024.0 ** 3)
+
+
+def _read_cgroup_memory_stats() -> Optional[Dict[str, int]]:
+    """Read a small, useful cgroup-v2 memory breakdown when available."""
+    root = Path("/sys/fs/cgroup")
+    current_p = root / "memory.current"
+    stat_p = root / "memory.stat"
+    if not current_p.exists() or not stat_p.exists():
+        return None
+    try:
+        out: Dict[str, int] = {"current": int(current_p.read_text().strip())}
+        for line in stat_p.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] in {"anon", "file", "shmem", "slab"}:
+                out[parts[0]] = int(parts[1])
+        return out
+    except Exception:
+        return None
+
+
+def _format_cgroup_memory_stats(stats: Optional[Dict[str, int]]) -> str:
+    if not stats:
+        return "cgroup memory stats unavailable"
+    return " ".join(
+        f"{key}={_bytes_gib(stats[key]):.2f}GiB"
+        for key in ("current", "anon", "file", "shmem", "slab")
+        if key in stats
+    )
+
+
+def _mount_info_for_path(path: str) -> Tuple[str, str]:
+    """Return (filesystem type, mountpoint) for ``path`` best-effort."""
+    path = os.path.abspath(path)
+    best = ("unknown", "/")
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mountpoint, fstype = parts[1], parts[2]
+                if path == mountpoint or path.startswith(mountpoint.rstrip("/") + "/"):
+                    if len(mountpoint) > len(best[1]):
+                        best = (fstype, mountpoint)
+    except Exception:
+        pass
+    return best
+
+
+def _print_system_diag(prefix: str, tmpdir: str) -> None:
+    """Print inexpensive diagnostics for /dev/shm, memlock, and cgroup failures."""
+    fstype, mountpoint = _mount_info_for_path(tmpdir)
+    try:
+        du = shutil.disk_usage(tmpdir)
+        tmp_text = f"free={_bytes_gib(du.free):.2f}GiB total={_bytes_gib(du.total):.2f}GiB"
+    except Exception:
+        tmp_text = "unavailable"
+    try:
+        shm = shutil.disk_usage("/dev/shm")
+        shm_text = f"free={_bytes_gib(shm.free):.2f}GiB total={_bytes_gib(shm.total):.2f}GiB"
+    except Exception:
+        shm_text = "unavailable"
+    try:
+        nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+        memlock = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        limits = f"RLIMIT_NOFILE={nofile[0]}/{nofile[1]} RLIMIT_MEMLOCK={memlock[0]}/{memlock[1]}"
+    except Exception:
+        limits = "resource limits unavailable"
+    print(
+        f"{prefix} tmpdir={tmpdir} (fstype={fstype} mount={mountpoint}) {tmp_text} | "
+        f"/dev/shm {shm_text} | {limits}",
+        flush=True,
+    )
+
+
+def _maybe_enable_safe_dataloader_mode(args) -> None:
+    """Bound reader, pinned-memory, and IPC pressure for large DDP HDF5 jobs.
+
+    The failure mode observed in long refits is host-memory growth rather than a
+    CUDA OOM: ranks * workers * prefetch creates many outstanding graph batches,
+    and every worker used to hold every H5 shard open.  The conservative mode is
+    automatic for large DDP jobs, but can be explicitly disabled for throughput
+    experiments with --unsafe-dataloader.
+    """
+    if not getattr(args, "safe_dataloader", True):
+        return
+    total_workers = int(args.num_workers) * ddp_world_size()
+    threshold = max(1, int(args.safe_dataloader_worker_threshold))
+    if total_workers < threshold:
+        return
+
+    old_workers = int(args.num_workers)
+    old_val_workers = int(args.val_num_workers)
+    cap = int(args.max_workers_per_rank)
+    if cap >= 0:
+        args.num_workers = min(old_workers, cap)
+        if old_val_workers > 0:
+            args.val_num_workers = min(old_val_workers, cap)
+    args.prefetch_factor = 1
+    # pin-memory uses an additional per-rank pinning thread and shared IPC
+    # buffers.  The fatal SIGILL dump had an active pin-memory loop, so remove
+    # this high-pressure source in the conservative configuration.
+    args.pin_memory = False
+    if ddp_is_main():
+        print(
+            f"[safe-dl] total requested workers={total_workers}; "
+            f"train workers/rank {old_workers}->{args.num_workers}, "
+            f"val workers/rank {old_val_workers}->{args.val_num_workers}, prefetch=1, pin_memory=False",
+            flush=True,
+        )
 
 
 def _stats_dict_to_arrays(stats_dict: Dict[str, Any], feature_names: List[str], *, kind: str):
@@ -921,42 +1052,68 @@ class DisplacedVertexGNN(nn.Module):
 # ============================================================
 
 class H5EventDataset(Dataset):
-    """Lazy HDF5 dataset for raw DisplacedVertex graph-level classification inputs."""
+    """Lazy graph reader with bounded per-process HDF5 state.
 
+    A refit launches one DDP rank per GPU and (previously) several workers per
+    rank.  Opening every shard in each persistent worker multiplies HDF5
+    metadata/raw chunk caches and cgroup-charged page cache.  This dataset keeps
+    only a small LRU of read-only files open per process and disables HDF5's raw
+    chunk cache by default.
+    """
     def __init__(
         self,
-        h5_paths,
+        h5_paths: List[str],
+        *,
+        max_open_files: int = 2,
+        rdcc_nbytes: int = 0,
+        drop_os_cache: bool = True,
     ):
         self.h5_paths = list(h5_paths)
-
         if not self.h5_paths:
             raise ValueError("No H5 files provided.")
+        if int(max_open_files) < 1:
+            raise ValueError("max_open_files must be >= 1.")
+        if int(rdcc_nbytes) < 0:
+            raise ValueError("rdcc_nbytes must be >= 0.")
 
-        self.index: List[Tuple[int, str]] = []
+        # Store a per-file key list instead of a Python (file_index, key) tuple
+        # per event.  The latter is very expensive for ~1.8M events and is
+        # copied/pickled into every DataLoader worker.
+        self._keys_by_file: List[List[str]] = []
+        counts: List[int] = []
         labels: List[float] = []
-        dataset_names: List[str] = []
-        root_files: List[str] = []
-
-        for fi, p in enumerate(self.h5_paths):
-            with h5py.File(p, "r") as f:
+        for p in self.h5_paths:
+            with h5py.File(p, "r", rdcc_nbytes=int(rdcc_nbytes)) as f:
                 if "events" not in f:
-                    continue
-                for k in sorted(list(f["events"].keys())):
-                    g = f["events"][k]
-                    y_np = self._read_label_from_group(g, file_path=p, event_key=k)
-                    self.index.append((fi, k))
-                    labels.append(float(y_np.reshape(-1)[0]))
-                    dataset_names.append(_decode_attr_to_str(g.attrs.get("dataset_name", "unknown")))
-                    root_files.append(_decode_attr_to_str(g.attrs.get("root_file", "unknown")))
+                    keys: List[str] = []
+                else:
+                    keys = sorted(f["events"].keys())
+                    for k in keys:
+                        y_np = self._read_label_from_group(f["events"][k], file_path=p, event_key=k)
+                        labels.append(float(y_np[0]))
+                self._keys_by_file.append(keys)
+                counts.append(len(keys))
 
-        if not self.index:
+        self._cum_counts = np.cumsum(np.asarray(counts, dtype=np.int64))
+        self._n_events = int(self._cum_counts[-1]) if self._cum_counts.size else 0
+        if self._n_events <= 0:
             raise ValueError("No events found in provided H5 files.")
-
         self.labels_np = np.asarray(labels, dtype=np.float32)
-        self.dataset_names = np.asarray(dataset_names, dtype=object)
-        self.root_files = np.asarray(root_files, dtype=object)
-        self._files = None
-        self._pid = None
+
+        self.max_open_files = int(max_open_files)
+        self.rdcc_nbytes = int(rdcc_nbytes)
+        self.drop_os_cache = bool(drop_os_cache)
+        self._files: OrderedDict[int, Any] = OrderedDict()
+        self._pid: Optional[int] = None
+        self._atexit_registered = False
+
+    def __getstate__(self):
+        """Never serialize live h5py handles into spawn/forkserver workers."""
+        state = self.__dict__.copy()
+        state["_files"] = OrderedDict()
+        state["_pid"] = None
+        state["_atexit_registered"] = False
+        return state
 
     @staticmethod
     def _read_label_from_group(g, *, file_path: str, event_key: str) -> np.ndarray:
@@ -979,36 +1136,78 @@ class H5EventDataset(Dataset):
         return y.astype(np.float32, copy=False)
 
     def __len__(self):
-        return len(self.index)
+        return self._n_events
 
-    def _close_files(self):
-        if self._files is None:
+    def _locate(self, idx: int) -> Tuple[int, str]:
+        idx = int(idx)
+        if idx < 0:
+            idx += self._n_events
+        if idx < 0 or idx >= self._n_events:
+            raise IndexError(idx)
+        fi = int(np.searchsorted(self._cum_counts, idx, side="right"))
+        start = int(self._cum_counts[fi - 1]) if fi > 0 else 0
+        return fi, self._keys_by_file[fi][idx - start]
+
+    def _ensure_process_cache(self) -> None:
+        pid = os.getpid()
+        if self._pid == pid:
             return
-        for f in self._files:
+        self._close_files()
+        self._pid = pid
+        if not self._atexit_registered:
+            atexit.register(self._close_files)
+            self._atexit_registered = True
+
+    def _advise_drop_os_cache(self, f) -> None:
+        """Let Linux reclaim clean pages when a read-only shard is evicted."""
+        if not self.drop_os_cache or not hasattr(os, "posix_fadvise"):
+            return
+        try:
+            handle = f.id.get_vfd_handle()
+            fd = handle[0] if isinstance(handle, tuple) else handle
+            if isinstance(fd, int):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except Exception:
+            pass
+
+    def _close_one_file(self, f) -> None:
+        try:
+            self._advise_drop_os_cache(f)
+        finally:
             try:
                 f.close()
             except Exception:
                 pass
-        self._files = None
 
-    def _ensure_open(self):
-        pid = os.getpid()
-        if self._files is not None and self._pid == pid:
+    def _get_file(self, fi: int):
+        self._ensure_process_cache()
+        f = self._files.pop(fi, None)
+        if f is not None:
+            self._files[fi] = f
+            return f
+        while len(self._files) >= self.max_open_files:
+            _, old = self._files.popitem(last=False)
+            self._close_one_file(old)
+        f = h5py.File(self.h5_paths[fi], "r", rdcc_nbytes=self.rdcc_nbytes)
+        self._files[fi] = f
+        return f
+
+    def _close_files(self) -> None:
+        files = getattr(self, "_files", None)
+        if not files:
+            self._files = OrderedDict()
             return
-        self._close_files()
-        self._pid = pid
-        self._files = [h5py.File(p, "r") for p in self.h5_paths]
-        atexit.register(self._close_files)
+        for f in list(files.values()):
+            self._close_one_file(f)
+        files.clear()
+        self._files = OrderedDict()
 
     def get_label(self, idx: int) -> float:
         return float(self.labels_np[int(idx)])
 
     def __getitem__(self, idx):
-        self._ensure_open()
-        assert self._files is not None
-
-        fi, k = self.index[idx]
-        f = self._files[fi]
+        fi, k = self._locate(idx)
+        f = self._get_file(fi)
         g = f["events"][k]
 
         x = torch.from_numpy(g["x"][...]).float()
@@ -1018,22 +1217,32 @@ class H5EventDataset(Dataset):
 
         if edge_index.ndim == 2 and edge_index.shape[0] != 2:
             edge_index = edge_index.t().contiguous()
-
         if "n_muon_nodes" not in g.attrs:
             raise RuntimeError(
                 f"Missing attribute 'n_muon_nodes' in {self.h5_paths[fi]} /events/{k}; "
                 "cannot split muon/calo nodes for model-side feature normalization."
             )
-        n_muon_nodes = torch.tensor(int(g.attrs["n_muon_nodes"]), dtype=torch.long)
-
         return {
             "x": x,
             "edge_index": edge_index,
             "edge_attr": edge_attr,
             "y": y,
             "labels": y,
-            "n_muon_nodes": n_muon_nodes,
+            "n_muon_nodes": torch.tensor(int(g.attrs["n_muon_nodes"]), dtype=torch.long),
         }
+
+
+class NumpyIndexSubset(Dataset):
+    """Subset backed by an int64 NumPy array, not a Python list of integers."""
+    def __init__(self, dataset: Dataset, indices):
+        self.dataset = dataset
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self):
+        return int(self.indices.size)
+
+    def __getitem__(self, idx):
+        return self.dataset[int(self.indices[int(idx)])]
 
 
 def _decode_attr_to_str(v) -> str:
@@ -1648,49 +1857,59 @@ def _try_resume_from_checkpoint(
     model: nn.Module,
     opt: torch.optim.Optimizer,
     scheduler,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     ema: Optional[EMA],
     device: torch.device,
 ):
+    """Restore an exact training state from a best or recovery checkpoint."""
     p = Path(ckpt_path)
     if not p.exists():
         return 1, None, 0, None, False
 
-    ckpt = torch.load(str(p), map_location="cpu")
+    try:
+        ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(p), map_location="cpu")
     raw_model = model.module if hasattr(model, "module") else model
-    raw_model.load_state_dict(ckpt["model_state"], strict=True)
+    raw_model.load_state_dict(ckpt.get("resume_model_state", ckpt["model_state"]), strict=True)
     raw_model.to(device)
 
     if "optimizer_state" in ckpt:
         opt.load_state_dict(ckpt["optimizer_state"])
-    if "scheduler_state" in ckpt and scheduler is not None:
+    if scheduler is not None and ckpt.get("scheduler_state") is not None:
         try:
             scheduler.load_state_dict(ckpt["scheduler_state"])
         except Exception:
             pass
-    if "scaler_state" in ckpt and scaler is not None and scaler.is_enabled():
+    if scaler is not None and scaler.is_enabled() and ckpt.get("scaler_state") is not None:
         try:
             scaler.load_state_dict(ckpt["scaler_state"])
         except Exception:
             pass
-    if ema is not None and "ema_shadow" in ckpt and isinstance(ckpt["ema_shadow"], dict):
-        raw_state = raw_model.state_dict()
-        ema.shadow = {
-            k: v.detach().to(device=raw_state[k].device, dtype=raw_state[k].dtype).clone()
-            if k in raw_state and torch.is_tensor(v)
-            else v.clone()
-            for k, v in ckpt["ema_shadow"].items()
-            if torch.is_tensor(v)
-        }
+
+    if ema is not None and isinstance(ckpt.get("ema_shadow"), dict):
+        model_state = raw_model.state_dict()
+        restored: Dict[str, torch.Tensor] = {}
+        for key, value in ckpt["ema_shadow"].items():
+            if not torch.is_tensor(value):
+                continue
+            if key in model_state:
+                ref = model_state[key]
+                restored[key] = value.detach().to(device=ref.device, dtype=ref.dtype).clone()
+            else:
+                restored[key] = value.detach().to(device=device).clone()
+        ema.shadow = restored
 
     last_epoch = int(ckpt.get("epoch", 0))
-    best_monitor = ckpt.get("best_monitor", None)
+    best_monitor = ckpt.get("best_monitor")
     bad_epochs = int(ckpt.get("bad_epochs", 0))
-    best_ckpt_epoch = ckpt.get("best_ckpt_epoch", None)
-    start_epoch = max(1, last_epoch + 1)
-    return start_epoch, best_monitor, bad_epochs, best_ckpt_epoch, True
-
-
+    best_ckpt_epoch = ckpt.get("best_ckpt_epoch")
+    if best_ckpt_epoch is not None:
+        try:
+            bad_epochs = min(max(0, bad_epochs), max(0, last_epoch - int(best_ckpt_epoch)))
+        except (TypeError, ValueError):
+            pass
+    return max(1, last_epoch + 1), best_monitor, bad_epochs, best_ckpt_epoch, True
 
 
 def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -1741,11 +1960,13 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Negative-class gamma for asymmetric focal loss.")
     ap.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for class metrics.")
     ap.add_argument("--target-fpr", type=float, default=0.01,
-                    help="FPR working point for tpr_at_target_fpr metric. Default 0.01 = 1% FPR.")
+                    help="FPR working point for tpr_at_target_fpr metric. Default 0.01 = 1%% FPR.")
     ap.add_argument("--max-train-events", type=int, default=-1)
 
     ap.add_argument("--save", default="displaced_vertex_classifier_gnn.pt")
     ap.add_argument("--save-dir", default=None)
+    ap.add_argument("--save-last-every", type=int, default=1,
+                    help="Write an exact recovery checkpoint every N completed epochs; 0 disables it.")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--resume", dest="resume", action="store_true", default=False)
     ap.add_argument("--no-resume", dest="resume", action="store_false")
@@ -1756,14 +1977,36 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--time", action="store_true", default=True)
     ap.add_argument("--no-time", dest="time", action="store_false")
 
-    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--num-workers", type=int, default=4,
+                    help="Training DataLoader workers per DDP rank.")
+    ap.add_argument("--val-num-workers", type=int, default=0,
+                    help="Validation workers per rank; 0 keeps long DDP validation in the rank process.")
     ap.add_argument("--pin-memory", action="store_true", default=True)
     ap.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
-    ap.add_argument("--prefetch-factor", type=int, default=2)
+    ap.add_argument("--prefetch-factor", type=int, default=1,
+                    help="Batches prefetched per worker. Outstanding batches scale with ranks * workers * prefetch.")
     ap.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=True)
     ap.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
-    ap.add_argument("--worker-start-method", type=str, default="fork",
-                    choices=["fork", "forkserver", "spawn"])
+    ap.add_argument("--worker-start-method", type=str, default="forkserver",
+                    choices=["fork", "forkserver", "spawn"],
+                    help="Use forkserver/spawn so workers do not inherit NCCL/HDF5 state.")
+    ap.add_argument("--safe-dataloader", dest="safe_dataloader", action="store_true", default=True,
+                    help="Automatically cap dangerous DDP reader/pinned-memory settings.")
+    ap.add_argument("--unsafe-dataloader", dest="safe_dataloader", action="store_false",
+                    help="Disable the conservative large-DDP HDF5 safeguards.")
+    ap.add_argument("--safe-dataloader-worker-threshold", type=int, default=16,
+                    help="Enable conservative mode at this many requested workers per node.")
+    ap.add_argument("--max-workers-per-rank", type=int, default=2,
+                    help="Maximum workers per rank in conservative mode; -1 disables the cap.")
+    ap.add_argument("--h5-max-open-files", type=int, default=1,
+                    help="Maximum H5 shards held open by each dataset process/worker.")
+    ap.add_argument("--h5-rdcc-nbytes", type=int, default=0,
+                    help="Per-open-file HDF5 raw chunk cache in bytes; 0 disables it.")
+    ap.add_argument("--h5-drop-os-cache", dest="h5_drop_os_cache", action="store_true", default=True,
+                    help="Advise Linux to reclaim clean H5 pages when an LRU shard is closed.")
+    ap.add_argument("--keep-h5-os-cache", dest="h5_drop_os_cache", action="store_false")
+    ap.add_argument("--memory-report-every", type=int, default=1,
+                    help="Rank-0 cgroup memory report cadence in epochs; 0 disables it.")
 
     ap.add_argument("--amp", action="store_true", default=True)
     ap.add_argument("--no-amp", dest="amp", action="store_false")
@@ -1816,6 +2059,19 @@ def _fmt_metric(v: float) -> str:
 
 
 def run_training(args, *, task_name: str = "displaced_vertex_classification"):
+    if args.save_last_every < 0:
+        raise SystemExit("--save-last-every must be >= 0.")
+    if args.val_num_workers < -1:
+        raise SystemExit("--val-num-workers must be >= -1.")
+    if args.val_num_workers == -1:
+        args.val_num_workers = args.num_workers
+    if args.h5_max_open_files < 1:
+        raise SystemExit("--h5-max-open-files must be >= 1.")
+    if args.h5_rdcc_nbytes < 0:
+        raise SystemExit("--h5-rdcc-nbytes must be >= 0.")
+    if args.memory_report_every < 0:
+        raise SystemExit("--memory-report-every must be >= 0.")
+
     try:
         faulthandler.enable(all_threads=True)
         faulthandler.register(signal.SIGBUS, all_threads=True, chain=True)
@@ -1841,6 +2097,7 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     ctx = mp.get_context(args.worker_start_method)
 
     ddp_setup()
+    _maybe_enable_safe_dataloader_mode(args)
     seed_all(args.seed + 1000 * ddp_rank())
 
     device = (
@@ -1851,6 +2108,15 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
 
     if ddp_is_main():
         print(f"[i] world_size={ddp_world_size()} device={device}", flush=True)
+        _print_system_diag("[system]", os.environ.get("TMPDIR", "/tmp"))
+        print(
+            f"[final-dl] train_workers={args.num_workers} val_workers={args.val_num_workers} "
+            f"pin_memory={args.pin_memory} persistent_workers={args.persistent_workers} "
+            f"prefetch_factor={args.prefetch_factor} start_method={args.worker_start_method} "
+            f"h5_max_open_files={args.h5_max_open_files} h5_rdcc_nbytes={args.h5_rdcc_nbytes} "
+            f"h5_drop_os_cache={args.h5_drop_os_cache}",
+            flush=True,
+        )
 
     run_id = args.run_id
     if ddp_is_main() and run_id is None:
@@ -1861,8 +2127,10 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         run_id = obj[0]
 
     save_path = _build_save_path(args, run_id)
+    recovery_path = _build_recovery_path(save_path)
     if ddp_is_main():
         print(f"[i] checkpoint path: {save_path}", flush=True)
+        print(f"[i] recovery checkpoint path: {recovery_path} (every {args.save_last_every} epoch(s))", flush=True)
 
     paths = sorted(glob.glob(args.data_glob))
     if not paths:
@@ -1884,7 +2152,12 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             )
 
     with timed_section("dataset_index", device=device, enabled=args.time) as tt:
-        ds = H5EventDataset(paths)
+        ds = H5EventDataset(
+            paths,
+            max_open_files=args.h5_max_open_files,
+            rdcc_nbytes=args.h5_rdcc_nbytes,
+            drop_os_cache=args.h5_drop_os_cache,
+        )
     if ddp_is_main() and args.time:
         print(f"[time] dataset indexing: {tt['seconds']:.3f}s", flush=True)
 
@@ -1911,8 +2184,8 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     v_neg, v_pos = _count_labels(ds.labels_np, val_idx)
     pos_weight_value = _parse_pos_weight(args.pos_weight, n_neg=n_neg, n_pos=n_pos)
 
-    train_ds = torch.utils.data.Subset(ds, train_idx.tolist())
-    val_ds = torch.utils.data.Subset(ds, val_idx.tolist())
+    train_ds = NumpyIndexSubset(ds, train_idx)
+    val_ds = NumpyIndexSubset(ds, val_idx)
 
     train_sampler = DistributedSampler(
         train_ds, num_replicas=ddp_world_size(), rank=ddp_rank(), shuffle=True, drop_last=True,
@@ -1921,22 +2194,33 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         val_ds, num_replicas=ddp_world_size(), rank=ddp_rank(), shuffle=False, drop_last=False,
     ) if ddp_is_initialized() else None
 
-    pin_device = f"cuda:{int(os.environ.get('LOCAL_RANK','0'))}" if torch.cuda.is_available() else ""
-    loader_kwargs = dict(
+    pin_device = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}" if torch.cuda.is_available() else ""
+    train_loader = DataLoader(
+        train_ds,
         batch_size=1,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=collate_one,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         pin_memory_device=pin_device,
+        multiprocessing_context=(ctx if args.num_workers > 0 else None),
+        persistent_workers=(args.persistent_workers and args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
-    if args.num_workers > 0:
-        loader_kwargs.update(
-            multiprocessing_context=ctx,
-            persistent_workers=args.persistent_workers,
-            prefetch_factor=args.prefetch_factor,
-        )
-    train_loader = DataLoader(train_ds, shuffle=(train_sampler is None), sampler=train_sampler, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **loader_kwargs)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        sampler=val_sampler,
+        collate_fn=collate_one,
+        num_workers=args.val_num_workers,
+        pin_memory=args.pin_memory,
+        pin_memory_device=pin_device,
+        multiprocessing_context=(ctx if args.val_num_workers > 0 else None),
+        persistent_workers=(args.persistent_workers and args.val_num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.val_num_workers > 0 else None),
+    )
 
     if ddp_is_initialized() and len(train_loader) == 0:
         raise RuntimeError(f"DDP training has 0 batches per rank (train_ds={len(train_ds)} world_size={ddp_world_size()}).")
@@ -2017,12 +2301,13 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     bad_epochs = 0
     best_ckpt_epoch = None
     if args.resume:
+        resume_source = recovery_path if Path(recovery_path).exists() else save_path
         start_epoch, best_monitor, bad_epochs, best_ckpt_epoch, did_resume = _try_resume_from_checkpoint(
-            ckpt_path=save_path, model=model, opt=opt, scheduler=scheduler, scaler=scaler,
+            ckpt_path=resume_source, model=model, opt=opt, scheduler=scheduler, scaler=scaler,
             ema=ema, device=device,
         )
         if did_resume and ddp_is_main():
-            print(f"[resume] resumed from {save_path} at epoch {start_epoch}", flush=True)
+            print(f"[resume] resumed from {resume_source} at epoch {start_epoch}", flush=True)
 
     if start_epoch > int(args.epochs):
         if ddp_is_main():
@@ -2186,10 +2471,15 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             best_ckpt_epoch = epoch
             save_ctx = ema.apply_to(model) if ema is not None else nullcontext()
             _ensure_parent_dir(str(save_path))
+            raw_model = model.module if hasattr(model, "module") else model
+            resume_model_state = _snapshot_state_dict_to_cpu(raw_model.state_dict())
+            ema_shadow_state = _snapshot_state_dict_to_cpu(ema.shadow) if ema is not None else None
             with save_ctx:
                 raw_model = model.module if hasattr(model, "module") else model
+                model_state = _snapshot_state_dict_to_cpu(raw_model.state_dict())
                 ckpt_obj = {
-                    "model_state": raw_model.state_dict(),
+                    "model_state": model_state,
+                    "resume_model_state": resume_model_state,
                     "task": task_name,
                     "model_type": "binary_graph_classifier",
                     "xdim": xdim,
@@ -2246,11 +2536,11 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                     "min_lr_ratio": args.min_lr_ratio,
                     "code_version": args.code_version,
                     "epoch": int(epoch),
-                    "bad_epochs": int(bad_epochs),
+                    "bad_epochs": 0,
                     "optimizer_state": opt.state_dict(),
                     "scheduler_state": (scheduler.state_dict() if scheduler is not None else None),
                     "scaler_state": (scaler.state_dict() if (scaler is not None and scaler.is_enabled()) else None),
-                    "ema_shadow": (ema.shadow if ema is not None else None),
+                    "ema_shadow": ema_shadow_state,
                 }
                 _torch_save_atomic_with_retries(ckpt_obj, save_path)
             print(
@@ -2305,6 +2595,43 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         stop_t = torch.tensor([1 if stop_now else 0], device=device, dtype=torch.int32)
         if ddp_is_initialized():
             dist.broadcast(stop_t, src=0)
+
+        # A best checkpoint is not an exact resume point: it may be many epochs
+        # behind the crash, and its inference state can be EMA weights.  Persist
+        # the raw model, optimizer, scheduler, scaler, and EMA shadow every epoch.
+        if ddp_is_main() and args.save_last_every > 0 and epoch % args.save_last_every == 0:
+            raw_model = model.module if hasattr(model, "module") else model
+            resume_model_state = _snapshot_state_dict_to_cpu(raw_model.state_dict())
+            ema_shadow_state = _snapshot_state_dict_to_cpu(ema.shadow) if ema is not None else None
+            recovery_obj = {
+                "model_state": (ema_shadow_state if ema_shadow_state is not None else resume_model_state),
+                "resume_model_state": resume_model_state,
+                "epoch": int(epoch),
+                "best_monitor": best_monitor,
+                "bad_epochs": int(bad_epochs),
+                "best_ckpt_epoch": best_ckpt_epoch,
+                "early_stop_monitor": args.early_stop_monitor,
+                "optimizer_state": opt.state_dict(),
+                "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+                "scaler_state": scaler.state_dict() if scaler is not None and scaler.is_enabled() else None,
+                "ema_shadow": ema_shadow_state,
+                "val_loss": float(val_metrics["loss"]),
+                "val_acc": float(val_metrics["acc"]),
+                "val_precision": float(val_metrics["precision"]),
+                "val_recall": float(val_metrics["recall"]),
+                "val_f1": float(val_metrics["f1"]),
+                "val_balanced_acc": float(val_metrics["balanced_acc"]),
+                "val_auc": float(val_metrics["auc"]),
+                "val_tpr_at_target_fpr": float(val_metrics["tpr_at_target_fpr"]),
+                "val_fpr_at_target_fpr": float(val_metrics["fpr_at_target_fpr"]),
+                "val_threshold_at_target_fpr": float(val_metrics["threshold_at_target_fpr"]),
+                "run_id": run_id,
+            }
+            _torch_save_atomic_with_retries(recovery_obj, recovery_path)
+            print(f"  [recovery] saved epoch {epoch} to {recovery_path}", flush=True)
+
+        if ddp_is_main() and args.memory_report_every > 0 and epoch % args.memory_report_every == 0:
+            print(f"  [memory] {_format_cgroup_memory_stats(_read_cgroup_memory_stats())}", flush=True)
         if bool(stop_t.item()):
             break
 

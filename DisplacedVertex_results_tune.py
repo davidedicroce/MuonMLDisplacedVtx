@@ -7,7 +7,7 @@ python -u DisplacedVertex_results_tune.py \
   --data-glob "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/*.h5" \
   --split-file "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/split_displaced_vertex_seed12345.npz" \
   --feature-stats-json "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json" \
-  --target-fprs 0.001 0.005 0.01 0.02 \
+  --target-fprs 0.001 0.01 \
   --force-recompute \
    2>&1 | tee log_dv_results_tune_$(date +%Y%m%d_%H%M%S).txt
 '''
@@ -1130,34 +1130,80 @@ def _is_generic_dataset_name(name: str) -> bool:
     return str(name).strip().lower() in GENERIC_DATASET_SAMPLE_NAMES
 
 
-def dataset_sample_for_index(dataset: H5EventDataset, idx: int) -> str:
-    """Return the physics sample for one dataset index.
+_INPUT_FILE_SAMPLE_LOOKUP_CACHE: dict[tuple[str, ...], tuple[np.ndarray, tuple[str, ...]]] = {}
+def build_input_file_sample_lookup(dataset: H5EventDataset,
+                                   input_paths: list[Path],
+                                   ) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Build a validated global-event-index -> physics-sample lookup.
 
-    Some H5 productions store a split/dataset label such as "validation" in
-    dataset_names.  That is useful for the global validation sample, but it is
-    not enough for per-signal-sample plots.  In that case, fall back to the
-    root file or H5 part file name so each requested physics sample is filled
-    separately while still using the validation split indices.
+    Do not use ``dataset_names`` here: some productions store only generic
+    labels such as ``unknown`` or ``validation`` there.  The H5 input filename
+    is the authoritative sample provenance for this evaluation, e.g.
+    ``MuonBucketDump_vertex_a_mumu_m10_ctau500_mu200_part12.h5`` maps to
+    ``vertex_a_mumu_m10_ctau500_mu200``.
     """
-    try:
-        name = decode_attr_to_str(dataset.dataset_names[int(idx)])
-        sample = sample_name_from_file(name)
-        if sample and not _is_generic_dataset_name(sample):
-            return sample
-    except Exception:
-        pass
-    try:
-        root_file = decode_attr_to_str(dataset.root_files[int(idx)])
-        sample = sample_name_from_file(root_file)
-        if sample and not _is_generic_dataset_name(sample):
-            return sample
-    except Exception:
-        pass
-    try:
-        fi, _ = dataset.index[int(idx)]
-        return sample_name_from_file(str(dataset.h5_paths[int(fi)]))
-    except Exception:
-        return "unknown"
+    path_key = tuple(str(Path(p).expanduser().resolve()) for p in input_paths)
+    if not path_key:
+        raise RuntimeError("Cannot build per-sample histograms: input_paths is empty.")
+
+    sample_names = tuple(sample_name_from_file(path) for path in path_key)
+    invalid_samples = [
+        (path, sample)
+        for path, sample in zip(path_key, sample_names)
+        if not sample or _is_generic_dataset_name(sample)
+    ]
+    if invalid_samples:
+        raise RuntimeError(
+            "Cannot derive a physics-sample name from one or more input H5 files: "
+            f"{invalid_samples[:5]}"
+        )
+
+    cached = _INPUT_FILE_SAMPLE_LOOKUP_CACHE.get(path_key)
+    if cached is None:
+        event_counts: list[int] = []
+        for h5_path in path_key:
+            one_file_dataset = H5EventDataset([h5_path])
+            try:
+                n_events = int(len(one_file_dataset))
+            finally:
+                del one_file_dataset
+            if n_events <= 0:
+                raise RuntimeError(
+                    f"Cannot build per-sample histograms: H5 file has no events: {h5_path}"
+                )
+            event_counts.append(n_events)
+
+        file_end_indices = np.cumsum(np.asarray(event_counts, dtype=np.int64))
+        cached = (file_end_indices, sample_names)
+        _INPUT_FILE_SAMPLE_LOOKUP_CACHE[path_key] = cached
+
+    file_end_indices, cached_sample_names = cached
+    if file_end_indices.size != len(path_key):
+        raise RuntimeError("Internal error: invalid cached H5-file sample lookup.")
+    if int(file_end_indices[-1]) != int(len(dataset)):
+        raise RuntimeError(
+            "Cannot safely assign per-sample histograms: the concatenated "
+            f"per-file event count ({int(file_end_indices[-1])}) does not match "
+            f"the full H5EventDataset length ({len(dataset)})."
+        )
+    return file_end_indices, cached_sample_names
+
+
+def sample_from_input_file_lookup(file_end_indices: np.ndarray,
+                                  sample_names: tuple[str, ...],
+                                  dataset_index: int) -> str:
+    """Return the source physics sample for one global dataset index."""
+    dataset_index = int(dataset_index)
+    total_events = int(file_end_indices[-1])
+    if dataset_index < 0 or dataset_index >= total_events:
+        raise IndexError(
+            f"Dataset index {dataset_index} is outside the valid range [0, {total_events})."
+        )
+
+    # ``side=right`` maps index 0..end[0]-1 to file 0 and index end[0]
+    # to file 1, exactly matching concatenated H5EventDataset indexing.
+    file_index = int(np.searchsorted(file_end_indices, dataset_index, side="right"))
+    return sample_names[file_index]
 
 
 def make_ort_feed(sess, item: dict) -> dict[str, np.ndarray]:
@@ -1208,6 +1254,13 @@ def evaluate_onnx_model_on_files(
     # normalize x or edge_attr before feeding the model.
     dataset = H5EventDataset([str(p) for p in input_paths])
     eval_indices, split_meta = build_eval_indices(args, input_paths, dataset)
+    file_end_indices, input_sample_names = build_input_file_sample_lookup(dataset, input_paths)
+
+    print(
+        f"[data] per-sample histogram provenance uses source H5 filenames: "
+        f"{len(input_paths)} file(s) -> {len(set(input_sample_names))} physics sample(s)",
+        flush=True,
+    )
 
     sess = make_ort_session(
         onnx_path=onnx_path,
@@ -1242,7 +1295,9 @@ def evaluate_onnx_model_on_files(
                 f"raw output shape={np.asarray(logits).shape}"
             )
 
-        sample = dataset_sample_for_index(dataset, int(ds_idx))
+        sample = sample_from_input_file_lookup(
+            file_end_indices, input_sample_names, int(ds_idx)
+        )
         update_hist_state(hist_state, probs, labels, sample=sample)
 
         if args.print_every and n_done % int(args.print_every) == 0:
