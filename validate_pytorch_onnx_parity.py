@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from dv_training_utils import H5EventDataset, collate_graphs
+from dv_training_utils import H5EventDataset, batch_model_inputs, collate_graphs, make_event_dataset
 from DisplacedVertex_results_tune import (
     build_displaced_vertex_model_from_checkpoint,
     build_eval_indices,
@@ -70,11 +70,14 @@ def main():
     output_names = [] if session is None else [x.name for x in session.get_outputs()]
 
     split = np.load(Path(args.split_file).resolve(), allow_pickle=True)
-    dataset = H5EventDataset(
+    dataset = make_event_dataset(
         [str(p) for p in paths], event_refs=split["event_refs"], labels=split["labels"],
         dataset_names=split["dataset_names"] if "dataset_names" in split.files else None,
         root_files=split["root_files"] if "root_files" in split.files else None,
         max_open_h5_files=16,
+        use_tracks=bool(getattr(pytorch_model, "use_tracks", False)),
+        use_segment_edges=bool(getattr(pytorch_model, "use_segment_edges", False)),
+        use_tracklets=bool(getattr(pytorch_model, "use_tracklets", False)),
     )
     index_args = SimpleNamespace(
         split_key=args.split_key, split_file=args.split_file,
@@ -97,14 +100,9 @@ def main():
             batch_indices = indices[start:start + max(1, args.batch_size)]
             items = [dataset[int(idx)] for idx in batch_indices]
             batch = collate_graphs(items)
+            model_args, model_kwargs = batch_model_inputs(batch, device)
             pt_logit = pytorch_model(
-                batch["x"].to(device).float(),
-                batch["edge_index"].to(device).long(),
-                batch["edge_attr"].to(device).float(),
-                n_muon_nodes=batch["n_muon_nodes"].to(device).long(),
-                batch=batch["batch"].to(device).long(),
-                node_is_muon=batch["node_is_muon"].to(device).bool(),
-                edge_dropout_p=0.0,
+                *model_args, **model_kwargs, edge_dropout_p=0.0,
             ).detach().cpu().numpy().reshape(-1)
             pt_prob = (1.0 / (1.0 + np.exp(-pt_logit.astype(np.float64)))).astype(np.float32)
             label = batch["y"].numpy().astype(np.int64).reshape(-1)

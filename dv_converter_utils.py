@@ -29,10 +29,9 @@ from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
-try:
-    import uproot
-except ImportError:  # ROOT reading needs uproot, but HDF5 dataset helpers can still be imported.
-    uproot = None
+# uproot is imported lazily in _open_tree_by_name: only the ROOT -> HDF5 conversion needs it, while the
+# trainer imports this module for the shared feature definitions (TRACK_FEATURE_NAMES, ...).
+uproot = None
 import h5py
 
 
@@ -55,6 +54,8 @@ REQUIRED_MUON_BRANCHES = [
     "bucket_sector",
     "bucket_segments",
 ]
+# Needed only for the segment-chi2 feature and the tracklet nodes (all MuonBucketDump versions have it)
+OPTIONAL_MUON_BRANCHES = ["segment_chiSquared"]
 
 REQUIRED_CALO_BRANCHES = [
     "CommonEventHash",
@@ -74,6 +75,136 @@ REQUIRED_VERTEX_BRANCHES = [
     "truthMuonVertexPositionZ",
 ]
 
+# Inner-tracker tracks, as dumped by IDTrackVertexDumperAlg into TrigFSTrackDump (trigger full-scan FTF),
+# TrigRoITrackDump (trigger FTF in cones around the segments) or IDTrackDump (offline): same branches.
+# The dumper keeps tracks with pT > --trigFSTrackMinPtGeV within dR < --trackSegmentDR (0.3) of a segment.
+_TRACK_VECTOR_BRANCHES = [
+    "track_pt",
+    "track_eta",
+    "track_phi",
+    "track_d0",
+    "track_z0",
+    "track_vz",
+    "track_d0Err",
+    "track_z0Err",
+    "track_charge",
+    "track_chiSquared",
+    "track_numberDoF",
+    "track_nPixelHits",
+    "track_nStripHits",
+]
+REQUIRED_TRACK_BRANCHES = ["CommonEventHash", *_TRACK_VECTOR_BRANCHES, "hsPV_z"]
+
+# Feature conventions of the classification graphs (shared with DVInferenceToolBase in Athena)
+DV_NODE_FEATURE_NAMES = ["r_pos", "theta_pos", "phi_pos", "theta_dir", "phi_dir", "energy_like", "nCells_or_DoF"]
+DV_EDGE_FEATURE_NAMES = ["d_energy_like", "d_phi", "d_eta", "cos_angle", "same_sector"]
+# Track nodes: perigee parameters; z0 relative to the hard-scatter vertex (first PriVtx, hsPV_z)
+TRACK_FEATURE_NAMES = [
+    "theta_dir",        # polar angle at the perigee
+    "phi_dir",          # azimuth at the perigee
+    "log_pt",           # ln(pT / GeV)
+    "q_over_pt",        # charge / pT [1/GeV]
+    "d0",               # signed transverse impact parameter [mm]
+    "d0_sig",           # d0 / sigma(d0)
+    "dz0_sintheta",     # (z0 + vz - z_PV) * sin(theta) [mm]
+    "dz0_sig",          # (z0 + vz - z_PV) / sigma(z0)
+    "n_pixel_hits",
+    "n_strip_hits",
+    "chi2_ndof",        # chi2 / max(nDoF, 1)
+]
+# Model-side input transform of the heavy-tailed track features: x -> asinh(x / scale) (0 = unchanged).
+# The H5 files and the Athena graph builder keep the raw values; the transform is part of the model
+# (DisplacedVertexGNN, embedded in the ONNX export) and the preprocessing computes the track
+# normalization statistics after it. Changing it requires rerunning DisplacedVertex_preproc.py.
+TRACK_FEATURE_ASINH_SCALES = {
+    "d0": 0.05,             # mm
+    "d0_sig": 1.0,
+    "dz0_sintheta": 0.5,    # mm
+    "dz0_sig": 1.0,
+    "chi2_ndof": 1.0,
+}
+
+
+def track_feature_asinh_scale_vector(names=None) -> np.ndarray:
+    """TRACK_FEATURE_ASINH_SCALES as a vector aligned with ``names`` (default TRACK_FEATURE_NAMES)."""
+    names = TRACK_FEATURE_NAMES if names is None else list(names)
+    return np.asarray([float(TRACK_FEATURE_ASINH_SCALES.get(n, 0.0)) for n in names], dtype=np.float32)
+
+
+TRACK_FEATURE_ASINH_ABS_MAX = 1.0e6  # |x / scale| cap before the asinh (asinh(1e6) = 14.5)
+
+
+def apply_track_feature_transform(track_x, scales=None) -> np.ndarray:
+    """numpy version of the model-side transform, same formula as dv_training_utils.onnx_safe_asinh:
+    asinh(x / scale) = sign * log(|.| + sqrt(|.|^2 + 1)) with |x / scale| capped at 1e6, where scale > 0; else x."""
+    track_x = np.asarray(track_x, dtype=np.float32)
+    scales = track_feature_asinh_scale_vector() if scales is None else np.asarray(scales, dtype=np.float32)
+    out = track_x.copy()
+    cols = np.nonzero(scales > 0)[0]
+    if out.size and cols.size:
+        v = out[:, cols] / scales[cols]
+        z = np.minimum(np.abs(v), np.float32(TRACK_FEATURE_ASINH_ABS_MAX))
+        out[:, cols] = np.sign(v) * np.log(z + np.sqrt(z * z + np.float32(1.0)))
+    return out
+
+
+DV_NODE_TYPE_MUON, DV_NODE_TYPE_CALO, DV_NODE_TYPE_TRACK, DV_NODE_TYPE_TRACKLET = 0, 1, 2, 3
+
+# Optional segment-quality feature of the muon nodes (converter --segment-chi2-feature): slot 5 of x
+# ("energy_like", always 0 for segments otherwise) holds chi2 / max(nDoF, 1) of the segment instead.
+# The muon-node energy_like used by the edge features stays 0.
+MUON_SLOT5_FEATURE_DEFAULT = "energy_like"
+MUON_SLOT5_FEATURE_CHI2 = "chi2_ndof"
+
+# Optional segment-segment edges (converter --segment-edges): all muon-node pairs with deltaR < --segment-edge-max-dr,
+# both directions; src -> dst features (chord = straight line between the two segment positions in the r-z plane).
+SEGMENT_EDGE_FEATURE_NAMES = [
+    "d_eta",            # eta(dst) - eta(src), segment positions
+    "d_phi",            # phi(dst) - phi(src), wrapped
+    "cos_angle",        # cosine between the segment directions
+    "chord_angle",      # max over the two segments of the r-z angle between segment direction and chord [rad];
+                        # 0 for chords shorter than SEGMENT_CHORD_MIN_LENGTH_MM
+    "chord_length_m",   # r-z distance between the segment positions [m]
+    "same_layer",       # same MS station layer (Inner / Middle / Outer / Extended / BarrelExtended)
+    "same_sector",      # same MS sector (bucket sector)
+]
+SEGMENT_CHORD_MIN_LENGTH_MM = 1.0
+
+# Optional MS tracklet nodes (converter --tracklets): connected components of the "chain" links between
+# segments in different station layers (deltaR < --tracklet-max-dr, chord_angle < --tracklet-max-chord-angle)
+# spanning >= --tracklet-min-layers layers. Each tracklet is linked to its segments, and the tracklets are
+# fully connected among themselves. "inner" / "outer" member: smallest / largest distance from the origin.
+TRACKLET_FEATURE_NAMES = [
+    "eta",              # mean eta of the member positions
+    "phi",              # circular mean phi of the member positions
+    "theta_chord",      # polar angle of the inner -> outer member chord
+    "n_segments",
+    "n_layers",         # distinct station layers
+    "d_inner_m",        # distance of the inner member from the origin [m]
+    "d_outer_m",        # distance of the outer member from the origin [m]
+    "max_chord_angle",  # largest chord_angle of the links inside the tracklet [rad]
+    "chord_rz_ip_m",    # r-z distance between the origin and the inner -> outer chord line [m]
+    "sum_ndof",         # sum of the member nDoF
+    "mean_chi2_ndof",   # mean member chi2 / max(nDoF, 1)
+]
+TRACKLET_EDGE_FEATURE_NAMES = [
+    "d_eta",            # eta(dst) - eta(src)
+    "d_phi",            # phi(dst) - phi(src), wrapped
+    "cos_angle",        # segment direction . tracklet chord (segment edges) / chord . chord (tracklet pairs)
+    "is_tracklet_pair", # 0: segment <-> tracklet edge, 1: tracklet <-> tracklet edge
+]
+
+# MS station layer of a chamber index, Muon::MuonStationIndex::toLayerIndex(ChIndex):
+# Inner 0 (BI, EI, CSC), Middle 1, Outer 2, Extended 3 (EE), BarrelExtended 4 (BEE); unknown chamber -1
+_CHAMBER_TO_STATION_LAYER = {0: 0, 1: 0, 7: 0, 8: 0, 15: 0, 16: 0, 2: 1, 3: 1, 9: 1, 10: 1,
+                             4: 2, 5: 2, 11: 2, 12: 2, 13: 3, 14: 3, 6: 4}
+
+
+def station_layer_from_chamber_index(chamber_index) -> np.ndarray:
+    """MS station layer (Muon::MuonStationIndex::toLayerIndex) of bucket chamber indices; -1 if unknown."""
+    ch = np.asarray(chamber_index, dtype=np.int64).ravel()
+    return np.asarray([_CHAMBER_TO_STATION_LAYER.get(int(c), -1) for c in ch], dtype=np.int64)
+
 
 # -------------------------------------------------------
 # Generic ROOT helpers
@@ -84,8 +215,13 @@ def _normalize_keys(keys):
 
 
 def _open_tree_by_name(root_file: str, tree_name: str):
+    global uproot
     if uproot is None:
-        raise ImportError("uproot is required to read ROOT files. Install it in the conversion environment.")
+        try:
+            import uproot as _uproot
+        except ImportError as exc:
+            raise ImportError("uproot is required to read ROOT files. Install it in the conversion environment.") from exc
+        uproot = _uproot
     f = uproot.open(root_file)
     if tree_name not in f:
         candidates = [k.split(";")[0] for k in f.keys()]
@@ -122,6 +258,9 @@ def _wrap_phi(dphi):
 
 
 def _phi_to_sector(phi, sector_mod):
+    """Legacy calo phi bin in [0, sector_mod), starting at phi=-pi. It does NOT follow the MS sector
+    numbering of the muon nodes (bucket_sector, 1-16, sector 1 centred at phi=0), so a muon-calo
+    same_sector built from it is always 0. Kept to reproduce the old datasets (--calo-sector-convention legacy)."""
     phi = np.asarray(phi, dtype=np.float32)
     phi01 = (phi + np.pi) / (2.0 * np.pi)
     sec = np.floor(phi01 * sector_mod).astype(np.int64)
@@ -129,15 +268,70 @@ def _phi_to_sector(phi, sector_mod):
     return sec
 
 
-def _read_tree(root_file: str, tree_name: str, required_branches):
+# MS sector geometry of Muon::MuonSectorMapping (MuonDetDescrUtils): 16 sectors, sector 1 centred at phi=0,
+# odd (large) sectors +-0.6*pi/8, even (small) ones +-0.4*pi/8, plus an overlap of 0.1*pi/8 on each side.
+_MS_PI8 = np.pi / 8.0
+_MS_LARGE_HALF_WIDTH = 0.6 * _MS_PI8
+_MS_SMALL_HALF_WIDTH = 0.4 * _MS_PI8
+_MS_OVERLAP = 0.1 * _MS_PI8
+
+
+def _ms_sector_phi(sector):
+    """MuonSectorMapping::sectorPhi: central phi of the MS sector [1-16]."""
+    sector = np.asarray(sector, dtype=np.float64)
+    return np.where(sector < 10, np.pi * (sector - 1.0) / 8.0, -np.pi * (2.0 - (sector - 1.0) / 8.0))
+
+
+def _ms_inside_sector(sector, phi):
+    """MuonSectorMapping::insideSector (sector width including the overlap)."""
+    half_width = np.where(np.asarray(sector) % 2 == 1, _MS_LARGE_HALF_WIDTH, _MS_SMALL_HALF_WIDTH) + _MS_OVERLAP
+    dphi = _wrap_phi(np.asarray(phi, dtype=np.float64) - _ms_sector_phi(sector))
+    return (dphi >= -half_width) & (dphi <= half_width)
+
+
+def ms_sector_from_phi(phi):
+    """MS sector number [1-16] of an azimuth, identical to MuonR4::ExpandedSector{phi}.msSector() as used by
+    DVInferenceToolBase for the calo-tower nodes: MuonSectorMapping::getSectors(phi) and, in an overlap region,
+    the first of the two sectors (the previous one in phi; 16 in the 16/1 overlap)."""
+    phi = _wrap_phi(np.asarray(phi, dtype=np.float64))
+    # MuonSectorMapping::getSector
+    val = (phi + _MS_LARGE_HALF_WIDTH) / _MS_PI8
+    val = np.where(val < 0.0, val + 16.0, val)
+    slice_idx = np.trunc(val / 2.0).astype(np.int64)
+    sector = 2 * slice_idx + 1 + ((val - 2.0 * slice_idx) > 1.2).astype(np.int64)
+    # MuonSectorMapping::getSectors: [previous (if inside), sector (if inside), next (if inside)]; take the first
+    previous = np.where(sector != 1, sector - 1, 16)
+    following = np.where(sector != 16, sector + 1, 1)
+    out = np.where(_ms_inside_sector(previous, phi), previous,
+                   np.where(_ms_inside_sector(sector, phi), sector, following))
+    return out.astype(np.int64)
+
+
+CALO_SECTOR_CONVENTIONS = ("cpp", "legacy")
+
+
+def _calo_sector(phi, sector_mod: int = 16, convention: str = "cpp"):
+    """Sector of a calo-tower (or track) node for the same_sector edge feature.
+    cpp:    MS sector number, comparable with the muon bucket_sector (as in DVInferenceToolBase)
+    legacy: _phi_to_sector (old converter; same_sector is then always 0 for muon-calo edges)"""
+    if convention == "cpp":
+        return ms_sector_from_phi(phi)
+    if convention == "legacy":
+        return _phi_to_sector(phi, sector_mod=sector_mod)
+    raise ValueError(f"Unknown calo sector convention {convention!r}; expected one of {CALO_SECTOR_CONVENTIONS}")
+
+
+def _read_tree(root_file: str, tree_name: str, required_branches, optional_branches=()):
+    """Read the required (and the available optional) branches of a tree, indexed by CommonEventHash."""
     tree = _open_tree_by_name(root_file, tree_name)
     clean = _normalize_keys(list(tree.keys()))
     missing = [k for k in required_branches if k not in clean]
     if missing:
         raise ValueError(f"Tree '{tree_name}' missing branches: {missing}")
 
-    arrays = tree.arrays([clean[k] for k in required_branches], library="np")
-    td = {k: arrays[clean[k]] for k in required_branches}
+    branches = list(required_branches) + [k for k in optional_branches if k in clean and k not in required_branches]
+    arrays = tree.arrays([clean[k] for k in branches], library="np")
+    td = {k: arrays[clean[k]] for k in branches}
 
     evh_arr = td["CommonEventHash"]
     event_keys = []
@@ -358,6 +552,8 @@ def _collect_muon_raw(td, idxs):
     x_mm_list, y_mm_list, z_mm_list = [], [], []
     dx_list, dy_list, dz_list = [], [], []
     segment_dof_list = []
+    segment_chi2_list = []
+    has_chi2 = "segment_chiSquared" in td
     bucket_seg_list, bucket_sector_list, bucket_chamber_list, bucket_layers_list = [], [], [], []
 
     for i in idxs:
@@ -368,8 +564,9 @@ def _collect_muon_raw(td, idxs):
         diry = np.asarray(td["segmentDirectionY"][i]).ravel()
         dirz = np.asarray(td["segmentDirectionZ"][i]).ravel()
         dof = np.asarray(td["segment_numberDoF"][i]).ravel()
+        chi2 = np.asarray(td["segment_chiSquared"][i]).ravel() if has_chi2 else np.full(len(dof), np.nan)
 
-        nseg = min(len(segx), len(segy), len(segz), len(dirx), len(diry), len(dirz), len(dof))
+        nseg = min(len(segx), len(segy), len(segz), len(dirx), len(diry), len(dirz), len(dof), len(chi2))
         if nseg == 0:
             continue
 
@@ -391,6 +588,7 @@ def _collect_muon_raw(td, idxs):
             dy_list.append(float(diry[j]))
             dz_list.append(float(dirz[j]))
             segment_dof_list.append(float(dof[j]))
+            segment_chi2_list.append(float(chi2[j]))
             bucket_seg_list.append(float(seg_count))
             bucket_sector_list.append(sec)
             bucket_chamber_list.append(chamber)
@@ -407,6 +605,7 @@ def _collect_muon_raw(td, idxs):
         "dy": np.asarray(dy_list, dtype=np.float32),
         "dz": np.asarray(dz_list, dtype=np.float32),
         "segment_dof": np.asarray(segment_dof_list, dtype=np.float32),
+        "segment_chi2": np.asarray(segment_chi2_list, dtype=np.float32),  # NaN without segment_chiSquared
         "bucket_seg": np.asarray(bucket_seg_list, dtype=np.float32),
         "bucket_sector": np.asarray(bucket_sector_list, dtype=np.int64),
         "bucket_chamber": np.asarray(bucket_chamber_list, dtype=np.int64),
@@ -424,6 +623,7 @@ def _collect_calo_filtered(
     max_tower_segment_dr,
     calo_r_max_mm,
     calo_z_max_mm,
+    sector_convention="legacy",
 ):
     """
     Filter calorimeter towers (energy cut, ΔR cut, envelope intersection).
@@ -433,7 +633,7 @@ def _collect_calo_filtered(
         dx, dy, dz  : direction components
         tower_xyz_m : intersection point with calorimeter envelope [m]
         tower_min_dr : minimum ΔR to any muon segment
-        sector       : phi sector index
+        sector       : phi sector index (see _calo_sector for the conventions)
     """
     if len(seg_eta_list) == 0:
         return None
@@ -508,7 +708,7 @@ def _collect_calo_filtered(
         "dz": np.asarray(dz_list, dtype=np.float32),
         "tower_xyz_m": np.asarray(tower_xyz_m_list, dtype=np.float32),
         "tower_min_dr": np.asarray(tower_min_dr_list, dtype=np.float32),
-        "sector": _phi_to_sector(tower_phi, sector_mod=sector_mod).astype(np.int64),
+        "sector": _calo_sector(tower_phi, sector_mod=sector_mod, convention=sector_convention).astype(np.int64),
     }
 
 
@@ -979,7 +1179,7 @@ def _eta_from_xyz_mm(x_mm, y_mm, z_mm) -> np.ndarray:
     return eta.astype(np.float32)
 
 
-def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs):
+def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs, slot5_feature: str = MUON_SLOT5_FEATURE_DEFAULT):
     """
     Build muon-segment nodes using the cylindrical converter feature convention.
 
@@ -987,8 +1187,15 @@ def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs):
         [r, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, nCells_or_DoF]
 
     For muon segments, ``energy_like`` is zero and ``nCells_or_DoF`` is the
-    segment number of degrees of freedom.
+    segment number of degrees of freedom. With slot5_feature = MUON_SLOT5_FEATURE_CHI2 the
+    feature column 5 holds chi2 / max(nDoF, 1) instead (the energy_like array used by the
+    edge features stays 0).
+
+    The returned dict also carries the raw per-segment geometry of the segment-segment edges and
+    tracklet nodes (float64 positions in mm and unit directions, station layer, nDoF, chi2/nDoF).
     """
+    if slot5_feature not in (MUON_SLOT5_FEATURE_DEFAULT, MUON_SLOT5_FEATURE_CHI2):
+        raise ValueError(f"Unknown muon slot-5 feature {slot5_feature!r}")
     raw = _collect_muon_raw(muon_td, idxs)
     if raw is None:
         return None
@@ -1007,11 +1214,23 @@ def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs):
     eta = _eta_from_xyz_mm(x_mm, y_mm, z_mm)
     energy_like = np.zeros(len(x_mm), dtype=np.float32)
     ncells_or_dof = raw["segment_dof"].astype(np.float32)
+    chi2_ndof = (raw["segment_chi2"].astype(np.float64) / np.maximum(raw["segment_dof"].astype(np.float64), 1.0))
+    if slot5_feature == MUON_SLOT5_FEATURE_CHI2:
+        if not np.all(np.isfinite(chi2_ndof)):
+            raise ValueError("The segment-chi2 feature needs the MuonBucketDump branch segment_chiSquared.")
+        slot5 = chi2_ndof.astype(np.float32)
+    else:
+        slot5 = energy_like
 
     x = np.stack(
-        [r_pos, theta_pos, phi_pos, theta_dir, phi_dir, energy_like, ncells_or_dof],
+        [r_pos, theta_pos, phi_pos, theta_dir, phi_dir, slot5, ncells_or_dof],
         axis=1,
     ).astype(np.float32)
+
+    seg_pos_mm = np.stack([x_mm, y_mm, z_mm], axis=1).astype(np.float64)
+    seg_dir = np.stack([raw["dx"], raw["dy"], raw["dz"]], axis=1).astype(np.float64)
+    seg_dir_norm = np.linalg.norm(seg_dir, axis=1, keepdims=True)
+    seg_dir = seg_dir / np.where(seg_dir_norm > 0, seg_dir_norm, 1.0)
 
     return {
         "x": x,
@@ -1031,6 +1250,12 @@ def build_displaced_vertex_muon_nodes_cylindrical(muon_td, idxs):
             ],
             axis=1,
         ),
+        # raw segment geometry for the segment-segment edges / tracklets (not written to the H5 files)
+        "seg_pos_mm": seg_pos_mm,
+        "seg_dir": seg_dir,
+        "seg_layer": station_layer_from_chamber_index(raw["bucket_chamber"]),
+        "seg_ndof": raw["segment_dof"].astype(np.float64),
+        "seg_chi2_ndof": chi2_ndof,
     }
 
 
@@ -1044,12 +1269,15 @@ def build_displaced_vertex_calo_nodes_cylindrical(
     calo_z_max_mm: float,
     seg_eta_list,
     seg_phi_list,
+    sector_convention: str = "cpp",
 ):
     """
     Build calorimeter tower nodes using the cylindrical converter convention.
 
     Towers are filtered by energy, ΔR to muon segments, and the calorimeter
     envelope intersection, matching the previous cylindrical converter logic.
+    The tower sector follows ``sector_convention`` (default "cpp": MS sector number, as in
+    DVInferenceToolBase; "legacy": the old phi bin).
     """
     raw = _collect_calo_filtered(
         calo_td,
@@ -1061,6 +1289,7 @@ def build_displaced_vertex_calo_nodes_cylindrical(
         max_tower_segment_dr,
         calo_r_max_mm,
         calo_z_max_mm,
+        sector_convention=sector_convention,
     )
     if raw is None:
         return None
@@ -1189,6 +1418,384 @@ def assemble_displaced_vertex_graph(
     }
 
 
+def build_displaced_vertex_track_nodes(
+    track_td,
+    idxs,
+    seg_eta_list,
+    seg_phi_list,
+    min_track_pt_mev: float = 2000.0,
+    max_track_segment_dr: float = 0.3,
+    max_track_dz0_sintheta_mm: float = -1.0,
+):
+    """
+    Build inner-tracker track nodes (TRACK_FEATURE_NAMES) from a TrigFSTrackDump-like tree.
+
+    Selection (to be mirrored by the Athena graph builder):
+      - pT >= min_track_pt_mev
+      - deltaR(track perigee eta/phi, muon-node eta/phi) < max_track_segment_dr for at least one muon node
+        (the dumper already applied its own cone, dR < 0.3 by default, so larger values have no effect)
+      - optionally |(z0 + vz - z_PV) sin(theta)| <= max_track_dz0_sintheta_mm (< 0: no cut)
+    Without a hard-scatter vertex (hsPV_z = -999) the z0 features are 0, i.e. the track counts as compatible with
+    the vertex, as in the prompt-track veto (MlMuonDVtxTrkVetoHypoTool).
+
+    Returns None when no track passes, else a dict with the node features ``x`` [T, 11] and the
+    eta/phi/energy_like (= pT in MeV)/dir_u/sector arrays used to build the track-segment edges.
+    """
+    if track_td is None or idxs is None or len(idxs) == 0:
+        return None
+    seg_eta = np.asarray(seg_eta_list, dtype=np.float32)
+    seg_phi = np.asarray(seg_phi_list, dtype=np.float32)
+    if seg_eta.size == 0:
+        return None
+
+    cols = {b: [] for b in _TRACK_VECTOR_BRANCHES}
+    pv_z = None
+    for i in idxs:
+        per_branch = {b: np.asarray(track_td[b][i]).ravel() for b in _TRACK_VECTOR_BRANCHES}
+        n = min(len(v) for v in per_branch.values())
+        for b, v in per_branch.items():
+            cols[b].append(v[:n].astype(np.float64))
+        if pv_z is None:
+            z = np.asarray(track_td["hsPV_z"][i], dtype=np.float64).ravel()
+            if z.size and np.isfinite(z[0]) and z[0] > -998.0:
+                pv_z = float(z[0])
+    trk = {b: np.concatenate(v) if v else np.zeros(0, dtype=np.float64) for b, v in cols.items()}
+    if trk["track_pt"].size == 0:
+        return None
+
+    eta32 = trk["track_eta"].astype(np.float32)
+    phi32 = trk["track_phi"].astype(np.float32)
+    dr = np.hypot(eta32[:, None] - seg_eta[None, :], _wrap_phi(phi32[:, None] - seg_phi[None, :]))
+    min_dr = dr.min(axis=1).astype(np.float32)
+
+    theta = 2.0 * np.arctan(np.exp(-trk["track_eta"]))
+    dz = trk["track_z0"] + trk["track_vz"] - pv_z if pv_z is not None else np.zeros_like(trk["track_pt"])
+    dz0_sintheta = dz * np.sin(theta)
+
+    keep = (trk["track_pt"] >= min_track_pt_mev) & (min_dr < max_track_segment_dr)
+    if max_track_dz0_sintheta_mm is not None and max_track_dz0_sintheta_mm >= 0:
+        keep &= np.abs(dz0_sintheta) <= max_track_dz0_sintheta_mm
+    if not np.any(keep):
+        return None
+
+    pt_gev = trk["track_pt"][keep] / 1000.0
+    d0 = trk["track_d0"][keep]
+    d0_err = trk["track_d0Err"][keep]
+    z0_err = trk["track_z0Err"][keep]
+    th = theta[keep]
+    ph = trk["track_phi"][keep]
+    x = np.stack(
+        [
+            th,
+            ph,
+            np.log(pt_gev),
+            trk["track_charge"][keep] / pt_gev,
+            d0,
+            np.divide(d0, d0_err, out=np.zeros_like(d0), where=d0_err > 0),
+            dz0_sintheta[keep],
+            np.divide(dz[keep], z0_err, out=np.zeros_like(d0), where=z0_err > 0),
+            trk["track_nPixelHits"][keep],
+            trk["track_nStripHits"][keep],
+            trk["track_chiSquared"][keep] / np.maximum(trk["track_numberDoF"][keep], 1.0),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    dir_u = np.stack([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)], axis=1).astype(np.float32)
+
+    return {
+        "x": x,
+        "eta": eta32[keep],
+        "phi": phi32[keep],
+        "energy_like": trk["track_pt"][keep].astype(np.float32),
+        "dir_u": dir_u,
+        "sector": ms_sector_from_phi(phi32[keep]),
+        "node_type": np.full(int(keep.sum()), DV_NODE_TYPE_TRACK, dtype=np.int64),
+        "min_dr": min_dr[keep],
+        "has_pv": pv_z is not None,
+    }
+
+
+def build_edges_track_segment_by_dr(mu_eta, mu_phi, trk_eta, trk_phi, max_track_segment_dr, track_offset):
+    """
+    Directed muon-segment <-> track edges for pairs with deltaR < max_track_segment_dr, both directions,
+    muon-major order like build_edges_segment_tower_by_dr. Track node t has the global index track_offset + t,
+    i.e. the track nodes are appended after the muon and calo nodes of ``x``.
+    """
+    mu_eta = np.asarray(mu_eta, dtype=np.float32)
+    mu_phi = np.asarray(mu_phi, dtype=np.float32)
+    trk_eta = np.asarray(trk_eta, dtype=np.float32)
+    trk_phi = np.asarray(trk_phi, dtype=np.float32)
+    if mu_eta.size == 0 or trk_eta.size == 0:
+        return np.zeros((2, 0), dtype=np.int64)
+    dr = np.hypot(mu_eta[:, None] - trk_eta[None, :], _wrap_phi(mu_phi[:, None] - trk_phi[None, :]))
+    mu_idx, trk_idx = np.nonzero(dr < max_track_segment_dr)
+    trk_idx = trk_idx.astype(np.int64) + int(track_offset)
+    src = np.empty(2 * mu_idx.size, dtype=np.int64)
+    dst = np.empty(2 * mu_idx.size, dtype=np.int64)
+    src[0::2], dst[0::2] = mu_idx, trk_idx
+    src[1::2], dst[1::2] = trk_idx, mu_idx
+    return np.stack([src, dst], axis=0)
+
+
+def attach_track_nodes_to_graph(graph: dict, track_nodes, max_track_segment_dr: float) -> dict:
+    """
+    Add the track block to an assembled muon+calo graph without changing x/edge_index/edge_attr:
+      track_x          [T, len(TRACK_FEATURE_NAMES)]
+      track_edge_index [2, E_t]  global indices, track node t = x.shape[0] + t
+      track_edge_attr  [E_t, 5]  same features as edge_attr (energy_like of a track = pT [MeV];
+                                 same_sector compares the MS sector of the track phi with the bucket sector)
+    The full graph is concat(x-block, track_x-block), concat(edge_index, track_edge_index) and
+    concat(edge_attr, track_edge_attr); node types follow the order muon | calo | track.
+    """
+    n_mu = int(graph["n_muon_nodes"])
+    n_mc = int(graph["x"].shape[0])
+    n_feat = len(TRACK_FEATURE_NAMES)
+    if track_nodes is None:
+        graph.update(
+            {
+                "track_x": np.zeros((0, n_feat), dtype=np.float32),
+                "track_edge_index": np.zeros((2, 0), dtype=np.int64),
+                "track_edge_attr": np.zeros((0, len(DV_EDGE_FEATURE_NAMES)), dtype=np.float32),
+                "track_eta": np.zeros((0,), dtype=np.float32),
+                "track_phi": np.zeros((0,), dtype=np.float32),
+                "track_min_dr": np.zeros((0,), dtype=np.float32),
+                "n_track_nodes": 0,
+            }
+        )
+        return graph
+
+    track_edge_index = build_edges_track_segment_by_dr(
+        graph["eta"][:n_mu], graph["phi"][:n_mu], track_nodes["eta"], track_nodes["phi"],
+        max_track_segment_dr=max_track_segment_dr, track_offset=n_mc,
+    )
+    track_edge_attr = edge_features(
+        energy_like=np.concatenate([graph["energy_like"], track_nodes["energy_like"]]).astype(np.float32),
+        phi=np.concatenate([graph["phi"], track_nodes["phi"]]).astype(np.float32),
+        eta=np.concatenate([graph["eta"], track_nodes["eta"]]).astype(np.float32),
+        dir_u=np.concatenate([graph["dir_u"], track_nodes["dir_u"]], axis=0).astype(np.float32),
+        sector=np.concatenate([graph["sector"], track_nodes["sector"]]).astype(np.int64),
+        node_type=np.concatenate([graph["node_type"], track_nodes["node_type"]]).astype(np.int64),
+        edge_index=track_edge_index,
+    ).astype(np.float32)
+    graph.update(
+        {
+            "track_x": track_nodes["x"].astype(np.float32),
+            "track_edge_index": track_edge_index.astype(np.int64),
+            "track_edge_attr": track_edge_attr,
+            "track_eta": track_nodes["eta"].astype(np.float32),
+            "track_phi": track_nodes["phi"].astype(np.float32),
+            "track_min_dr": track_nodes["min_dr"].astype(np.float32),
+            "n_track_nodes": int(track_nodes["x"].shape[0]),
+        }
+    )
+    return graph
+
+
+def _segment_pair_geometry(mu_nodes: dict, a: np.ndarray, b: np.ndarray):
+    """
+    r-z chord geometry of the segment pairs (a[k], b[k]), float64 (mirrored by DVInferenceToolBase):
+      chord       = (r_b - r_a, z_b - z_a) between the segment positions, r = sqrt(x^2 + y^2)
+      chord_angle = max(angle(chord, d_a), angle(chord, d_b)), angle = acos(|unit chord . unit d_rz|) in [0, pi/2],
+                    d_rz = ((x dx + y dy) / r, dz) the segment direction in the r-z plane; 0 for chords shorter
+                    than SEGMENT_CHORD_MIN_LENGTH_MM
+    Returns (chord_angle [rad], chord_length [mm]).
+    """
+    pos = mu_nodes["seg_pos_mm"]
+    d = mu_nodes["seg_dir"]
+    r = np.hypot(pos[:, 0], pos[:, 1])
+    z = pos[:, 2]
+    safe_r = np.where(r > 0.0, r, 1.0)
+    d_r = np.where(r > 0.0, (pos[:, 0] * d[:, 0] + pos[:, 1] * d[:, 1]) / safe_r, np.hypot(d[:, 0], d[:, 1]))
+    d_z = d[:, 2]
+    d_norm = np.hypot(d_r, d_z)
+    d_norm = np.where(d_norm > 0.0, d_norm, 1.0)
+    d_r, d_z = d_r / d_norm, d_z / d_norm
+
+    c_r = r[b] - r[a]
+    c_z = z[b] - z[a]
+    length = np.hypot(c_r, c_z)
+    ok = length >= SEGMENT_CHORD_MIN_LENGTH_MM
+    safe_len = np.where(ok, length, 1.0)
+    c_r, c_z = c_r / safe_len, c_z / safe_len
+    ang_a = np.arccos(np.clip(np.abs(c_r * d_r[a] + c_z * d_z[a]), 0.0, 1.0))
+    ang_b = np.arccos(np.clip(np.abs(c_r * d_r[b] + c_z * d_z[b]), 0.0, 1.0))
+    return np.where(ok, np.maximum(ang_a, ang_b), 0.0), length
+
+
+def _muon_pairs_within_dr(eta, phi, max_dr: float):
+    """Muon-node pairs (i < j, row-major order) with deltaR(i, j) < max_dr (float32, as the other edge blocks)."""
+    eta = np.asarray(eta, dtype=np.float32)
+    phi = np.asarray(phi, dtype=np.float32)
+    a, b = np.triu_indices(eta.size, 1)
+    if a.size == 0:
+        return a.astype(np.int64), b.astype(np.int64)
+    dr = np.hypot(eta[a] - eta[b], _wrap_phi(phi[a] - phi[b]))
+    keep = dr < np.float32(max_dr)
+    return a[keep].astype(np.int64), b[keep].astype(np.int64)
+
+
+def build_segment_segment_edges(mu_nodes: dict, max_dr: float):
+    """
+    Segment-segment edges: all muon-node pairs with deltaR < max_dr, for each pair (i < j, row-major) the
+    edges i -> j and j -> i. Returns (seg_edge_index [2, E] with muon-node indices, seg_edge_attr [E, 7]
+    with SEGMENT_EDGE_FEATURE_NAMES).
+    """
+    n_feat = len(SEGMENT_EDGE_FEATURE_NAMES)
+    a, b = _muon_pairs_within_dr(mu_nodes["eta"], mu_nodes["phi"], max_dr)
+    if a.size == 0:
+        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, n_feat), dtype=np.float32)
+    src = np.empty(2 * a.size, dtype=np.int64)
+    dst = np.empty(2 * a.size, dtype=np.int64)
+    src[0::2], dst[0::2] = a, b
+    src[1::2], dst[1::2] = b, a
+
+    chord_angle, chord_length = _segment_pair_geometry(mu_nodes, a, b)
+    eta = np.asarray(mu_nodes["eta"], dtype=np.float32)
+    phi = np.asarray(mu_nodes["phi"], dtype=np.float32)
+    d = mu_nodes["seg_dir"]
+    layer = np.asarray(mu_nodes["seg_layer"])
+    sector = np.asarray(mu_nodes["sector"])
+    attr = np.empty((src.size, n_feat), dtype=np.float32)
+    attr[:, 0] = eta[dst] - eta[src]
+    attr[:, 1] = _wrap_phi(phi[dst] - phi[src])
+    attr[:, 2] = np.clip(np.sum(d[src] * d[dst], axis=1), -1.0, 1.0)
+    attr[:, 3] = np.repeat(chord_angle, 2)
+    attr[:, 4] = np.repeat(chord_length / 1000.0, 2)
+    attr[:, 5] = (layer[src] == layer[dst]).astype(np.float32)
+    attr[:, 6] = (sector[src] == sector[dst]).astype(np.float32)
+    return np.stack([src, dst], axis=0), attr
+
+
+def build_tracklets(mu_nodes: dict, max_dr: float, max_chord_angle: float, min_layers: int):
+    """
+    MS tracklets: connected components (union-find) of the links between muon nodes in different, known
+    station layers with deltaR < max_dr and chord_angle < max_chord_angle, keeping components with at least
+    min_layers distinct layers, ordered by their smallest muon-node index.
+    Returns a list of (member muon-node indices ascending, largest link chord_angle).
+    """
+    layer = np.asarray(mu_nodes["seg_layer"])
+    n = layer.size
+    a, b = _muon_pairs_within_dr(mu_nodes["eta"], mu_nodes["phi"], max_dr)
+    cand = (layer[a] != layer[b]) & (layer[a] >= 0) & (layer[b] >= 0)
+    a, b = a[cand], b[cand]
+    if a.size == 0:
+        return []
+    chord_angle, _ = _segment_pair_geometry(mu_nodes, a, b)
+    link = chord_angle < max_chord_angle
+    a, b, chord_angle = a[link], b[link], chord_angle[link]
+
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j in zip(a.tolist(), b.tolist()):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+    roots = np.asarray([find(i) for i in range(n)], dtype=np.int64)
+    max_angle = {}
+    for i, ang in zip(a.tolist(), chord_angle.tolist()):
+        r = int(roots[i])
+        max_angle[r] = max(max_angle.get(r, 0.0), ang)
+
+    tracklets = []
+    for r in sorted(max_angle):  # the root is the smallest member index
+        members = np.nonzero(roots == r)[0].astype(np.int64)
+        if np.unique(layer[members]).size >= int(min_layers):
+            tracklets.append((members, float(max_angle[r])))
+    return tracklets
+
+
+def build_tracklet_block(mu_nodes: dict, tracklets, n_graph_nodes: int):
+    """
+    Tracklet nodes (TRACKLET_FEATURE_NAMES) and edges (TRACKLET_EDGE_FEATURE_NAMES): for each tracklet k
+    (in order) and member i (ascending) the edges i -> t_k and t_k -> i, then t_k1 -> t_k2 for all
+    k1 != k2 (row-major). Tracklet node k has the index n_graph_nodes + k (n_graph_nodes = muon + calo nodes),
+    the same convention as the track block.
+    """
+    n_feat = len(TRACKLET_FEATURE_NAMES)
+    n_edge_feat = len(TRACKLET_EDGE_FEATURE_NAMES)
+    if not tracklets:
+        return (np.zeros((0, n_feat), dtype=np.float32), np.zeros((2, 0), dtype=np.int64),
+                np.zeros((0, n_edge_feat), dtype=np.float32))
+    eta = np.asarray(mu_nodes["eta"], dtype=np.float32)
+    phi = np.asarray(mu_nodes["phi"], dtype=np.float32)
+    pos = mu_nodes["seg_pos_mm"]
+    d = mu_nodes["seg_dir"]
+    layer = np.asarray(mu_nodes["seg_layer"])
+    chi2_ndof = mu_nodes["seg_chi2_ndof"]
+    if not np.all(np.isfinite(chi2_ndof)):
+        raise ValueError("The tracklet nodes need the MuonBucketDump branch segment_chiSquared.")
+    dist = np.linalg.norm(pos, axis=1)
+    rho = np.hypot(pos[:, 0], pos[:, 1])
+
+    K = len(tracklets)
+    tx = np.zeros((K, n_feat), dtype=np.float64)
+    t_eta = np.zeros(K, dtype=np.float32)
+    t_phi = np.zeros(K, dtype=np.float32)
+    t_dir = np.zeros((K, 3), dtype=np.float64)
+    for k, (m, max_angle) in enumerate(tracklets):
+        inner = int(m[np.argmin(dist[m])])
+        outer = int(m[np.argmax(dist[m])])
+        chord = pos[outer] - pos[inner]
+        chord_len = np.linalg.norm(chord)
+        t_dir[k] = chord / chord_len if chord_len > 0.0 else np.array([0.0, 0.0, 1.0])
+        c_r, c_z = rho[outer] - rho[inner], pos[outer, 2] - pos[inner, 2]
+        rz_len = np.hypot(c_r, c_z)
+        rz_ip = abs(rho[inner] * c_z - pos[inner, 2] * c_r) / rz_len if rz_len >= SEGMENT_CHORD_MIN_LENGTH_MM else 0.0
+        e_mean = float(np.mean(eta[m].astype(np.float64)))
+        p_mean = float(np.arctan2(np.sum(np.sin(phi[m].astype(np.float64))), np.sum(np.cos(phi[m].astype(np.float64)))))
+        tx[k] = [e_mean, p_mean, np.arctan2(np.hypot(chord[0], chord[1]), chord[2]), m.size,
+                 np.unique(layer[m]).size, dist[inner] / 1000.0, dist[outer] / 1000.0, max_angle,
+                 rz_ip / 1000.0, float(np.sum(mu_nodes["seg_ndof"][m])), float(np.mean(chi2_ndof[m]))]
+        t_eta[k], t_phi[k] = np.float32(e_mean), np.float32(p_mean)
+
+    src, dst, attr = [], [], []
+    for k, (m, _) in enumerate(tracklets):
+        t = n_graph_nodes + k
+        for i in m.tolist():
+            cosang = float(np.clip(np.dot(d[i], t_dir[k]), -1.0, 1.0))
+            src += [i, t]
+            dst += [t, i]
+            attr.append([t_eta[k] - eta[i], _wrap_phi(t_phi[k] - phi[i]), cosang, 0.0])
+            attr.append([eta[i] - t_eta[k], _wrap_phi(phi[i] - t_phi[k]), cosang, 0.0])
+    for k1 in range(K):
+        for k2 in range(K):
+            if k1 == k2:
+                continue
+            src.append(n_graph_nodes + k1)
+            dst.append(n_graph_nodes + k2)
+            attr.append([t_eta[k2] - t_eta[k1], _wrap_phi(t_phi[k2] - t_phi[k1]),
+                         float(np.clip(np.dot(t_dir[k1], t_dir[k2]), -1.0, 1.0)), 1.0])
+    return (tx.astype(np.float32), np.asarray([src, dst], dtype=np.int64).reshape(2, -1),
+            np.asarray(attr, dtype=np.float32).reshape(-1, n_edge_feat))
+
+
+def attach_segment_blocks_to_graph(graph: dict, mu_nodes: dict, segment_edge_max_dr: float = -1.0,
+                                   tracklet_max_dr: float = -1.0, tracklet_max_chord_angle: float = 0.2,
+                                   tracklet_min_layers: int = 2) -> dict:
+    """
+    Add the optional segment blocks to an assembled graph without changing x/edge_index/edge_attr:
+      seg_edge_index      [2, Es]  muon-node indices          (segment_edge_max_dr > 0)
+      seg_edge_attr       [Es, 7]  SEGMENT_EDGE_FEATURE_NAMES
+      tracklet_x          [K, 11]  TRACKLET_FEATURE_NAMES     (tracklet_max_dr > 0)
+      tracklet_edge_index [2, Ek]  muon-node indices and tracklet k = x.shape[0] + k
+      tracklet_edge_attr  [Ek, 4]  TRACKLET_EDGE_FEATURE_NAMES
+    """
+    if segment_edge_max_dr is not None and segment_edge_max_dr > 0:
+        graph["seg_edge_index"], graph["seg_edge_attr"] = build_segment_segment_edges(mu_nodes, segment_edge_max_dr)
+    if tracklet_max_dr is not None and tracklet_max_dr > 0:
+        tracklets = build_tracklets(mu_nodes, tracklet_max_dr, tracklet_max_chord_angle, tracklet_min_layers)
+        tx, tei, tea = build_tracklet_block(mu_nodes, tracklets, int(graph["x"].shape[0]))
+        graph.update({"tracklet_x": tx, "tracklet_edge_index": tei, "tracklet_edge_attr": tea,
+                      "n_tracklet_nodes": int(tx.shape[0])})
+    return graph
+
+
 def _try_read_optional_tree(root_path: str, tree_name: str, required_branches):
     """Read an optional tree; return ``(None, {}, [])`` when absent/incompatible."""
     try:
@@ -1214,6 +1821,16 @@ def iter_displaced_vertex_classification_samples(
     min_segments: int = 1,
     require_edges: bool = False,
     max_events: int = -1,
+    track_tree_name: str = "TrigFSTrackDump",
+    min_track_pt_mev: float = 2000.0,
+    max_track_segment_dr: float = 0.3,
+    max_track_dz0_sintheta_mm: float = -1.0,
+    calo_sector_convention: str = "cpp",
+    segment_chi2_feature: bool = True,
+    segment_edge_max_dr: float = 0.4,
+    tracklet_max_dr: float = 0.4,
+    tracklet_max_chord_angle: float = 0.2,
+    tracklet_min_layers: int = 2,
 ):
     """
     Yield one graph-classification sample per ROOT event that has usable nodes.
@@ -1221,11 +1838,28 @@ def iter_displaced_vertex_classification_samples(
     Each yielded sample contains numpy arrays with keys:
       x, edge_index, edge_attr, y, labels, phi, eta, energy_like, dir_u,
       sector, node_type, and optional diagnostic arrays.
+    With a track tree (track_tree_name, "" = no tracks) it also holds the track block
+    (track_x, track_edge_index, track_edge_attr, n_track_nodes, ...; see attach_track_nodes_to_graph).
+    The track block never changes x/edge_index/edge_attr, so graphs stay readable by muon+calo models.
+    Segment blocks (on by default, see attach_segment_blocks_to_graph; False / <= 0 switches them off):
+      segment_chi2_feature  muon-node feature 5 = chi2 / max(nDoF, 1) (changes x)
+      segment_edge_max_dr   > 0: segment-segment edges (seg_edge_index, seg_edge_attr)
+      tracklet_max_dr       > 0: MS tracklet nodes (tracklet_x, tracklet_edge_index, tracklet_edge_attr), built from
+                            the links with tracklet_max_chord_angle, kept with >= tracklet_min_layers station layers
     """
     signal_filename_patterns = _normalize_signal_filename_patterns(signal_filename_patterns)
-    mu_td, mu_ev_to_idx, mu_keys = _read_tree(root_path, muon_tree_name, REQUIRED_MUON_BRANCHES)
+    mu_td, mu_ev_to_idx, mu_keys = _read_tree(root_path, muon_tree_name, REQUIRED_MUON_BRANCHES,
+                                              optional_branches=OPTIONAL_MUON_BRANCHES)
+    needs_chi2 = bool(segment_chi2_feature) or (tracklet_max_dr is not None and tracklet_max_dr > 0)
+    if needs_chi2 and "segment_chiSquared" not in mu_td:
+        raise ValueError(f"{root_path}: the segment-chi2 feature / tracklets need the {muon_tree_name} branch "
+                         "segment_chiSquared.")
+    slot5_feature = MUON_SLOT5_FEATURE_CHI2 if segment_chi2_feature else MUON_SLOT5_FEATURE_DEFAULT
     ca_td, ca_ev_to_idx, _ = _try_read_optional_tree(root_path, calo_tree_name, REQUIRED_CALO_BRANCHES)
     vx_td, vx_ev_to_idx, _ = _try_read_optional_tree(root_path, vertex_tree_name, REQUIRED_VERTEX_BRANCHES)
+    tr_td, tr_ev_to_idx = None, {}
+    if track_tree_name:
+        tr_td, tr_ev_to_idx, _ = _try_read_optional_tree(root_path, track_tree_name, REQUIRED_TRACK_BRANCHES)
 
     dataset_name = _dataset_name_from_root_path(root_path)
     is_signal_file = _filename_matches_signal_patterns(root_path, signal_filename_patterns)
@@ -1268,7 +1902,7 @@ def iter_displaced_vertex_classification_samples(
         if is_signal_file and label != 1:
             continue
 
-        mu_nodes = build_displaced_vertex_muon_nodes_cylindrical(mu_td, mu_idxs)
+        mu_nodes = build_displaced_vertex_muon_nodes_cylindrical(mu_td, mu_idxs, slot5_feature=slot5_feature)
         if mu_nodes is None:
             continue
 
@@ -1284,6 +1918,7 @@ def iter_displaced_vertex_classification_samples(
                 calo_z_max_mm=calo_z_max_mm,
                 seg_eta_list=mu_nodes["eta"],
                 seg_phi_list=mu_nodes["phi"],
+                sector_convention=calo_sector_convention,
             )
 
         graph = assemble_displaced_vertex_graph(
@@ -1294,6 +1929,28 @@ def iter_displaced_vertex_classification_samples(
         )
         if graph is None:
             continue
+
+        if track_tree_name:
+            track_nodes = None
+            if tr_td is not None and evh in tr_ev_to_idx:
+                track_nodes = build_displaced_vertex_track_nodes(
+                    tr_td,
+                    np.asarray(tr_ev_to_idx[evh], dtype=np.int64),
+                    seg_eta_list=mu_nodes["eta"],
+                    seg_phi_list=mu_nodes["phi"],
+                    min_track_pt_mev=min_track_pt_mev,
+                    max_track_segment_dr=max_track_segment_dr,
+                    max_track_dz0_sintheta_mm=max_track_dz0_sintheta_mm,
+                )
+            attach_track_nodes_to_graph(graph, track_nodes, max_track_segment_dr=max_track_segment_dr)
+
+        attach_segment_blocks_to_graph(
+            graph, mu_nodes,
+            segment_edge_max_dr=segment_edge_max_dr,
+            tracklet_max_dr=tracklet_max_dr,
+            tracklet_max_chord_angle=tracklet_max_chord_angle,
+            tracklet_min_layers=tracklet_min_layers,
+        )
 
         y = np.asarray([label], dtype=np.float32)
         sample = dict(graph)
@@ -1320,6 +1977,10 @@ def _write_dv_classification_event_group(g, sample: dict) -> None:
     g.attrs["label"] = int(np.asarray(sample["y"]).ravel()[0])
     g.attrs["n_muon_nodes"] = int(sample.get("n_muon_nodes", 0))
     g.attrs["n_calo_nodes"] = int(sample.get("n_calo_nodes", 0))
+    if "n_track_nodes" in sample:
+        g.attrs["n_track_nodes"] = int(sample["n_track_nodes"])
+    if "n_tracklet_nodes" in sample:
+        g.attrs["n_tracklet_nodes"] = int(sample["n_tracklet_nodes"])
     if sample.get("dataset_name") is not None:
         g.attrs["dataset_name"] = str(sample["dataset_name"])
     if sample.get("root_file") is not None:
@@ -1337,6 +1998,200 @@ def _write_dv_classification_event_group(g, sample: dict) -> None:
         if key in sample and sample[key] is not None:
             g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
 
+    # Track block (absent when the conversion runs without a track tree)
+    for key in ("track_x", "track_edge_index", "track_edge_attr", "track_eta", "track_phi", "track_min_dr"):
+        if key in sample and sample[key] is not None:
+            g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
+
+    # Optional segment blocks (--segment-edges, --tracklets)
+    for key in ("seg_edge_index", "seg_edge_attr", "tracklet_x", "tracklet_edge_index", "tracklet_edge_attr"):
+        if key in sample and sample[key] is not None:
+            g.create_dataset(key, data=sample[key], compression="gzip", compression_opts=4)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Packed parts (converter --output-format packed, the default; pack_DisplacedVertex_dataset.py for H5 parts): the
+# training arrays of one part as uncompressed .npy files in <stem>.packed/, memory-mapped by the training
+# (dv_training_utils.PackedEventDataset): an event is a few array slices instead of ~12 gzip H5 datasets.
+#   <block>.npy + <block>_ptr.npy   blocks concatenated over the events (edge indices [2, E] along axis 1, int32),
+#                                   event e = ptr[e]:ptr[e+1]
+#   y.npy, n_muon_nodes.npy, event_key.npy, dataset_name.npy, root_file.npy   per event
+#   meta.json                       format, n_events, blocks, converter_config, muon_node_feature_names, file_attrs
+# Event keys and order are those of the H5 part (/events/0000000, ...): split files of the H5 parts stay valid.
+# The H5 diagnostics (phi, eta, vertex_rho_mm, muon_xyz_m, track_eta, ...) are not packed: the event viewers need
+# --output-format h5 or both.
+# ---------------------------------------------------------------------------------------------------------------------
+DV_PACKED_FORMAT = "dv_packed_v1"
+DV_PACKED_SUFFIX = ".packed"
+DV_PACKED_BLOCKS = {  # name -> columns of a feature block (None for the [2, E] edge indices)
+    "x": len(DV_NODE_FEATURE_NAMES), "edge_index": None, "edge_attr": len(DV_EDGE_FEATURE_NAMES),
+    "track_x": len(TRACK_FEATURE_NAMES), "track_edge_index": None, "track_edge_attr": len(DV_EDGE_FEATURE_NAMES),
+    "seg_edge_index": None, "seg_edge_attr": len(SEGMENT_EDGE_FEATURE_NAMES),
+    "tracklet_x": len(TRACKLET_FEATURE_NAMES), "tracklet_edge_index": None,
+    "tracklet_edge_attr": len(TRACKLET_EDGE_FEATURE_NAMES),
+}
+DV_PACKED_OPTIONAL = {
+    "use_tracks": ("track_x", "track_edge_index", "track_edge_attr"),
+    "use_segment_edges": ("seg_edge_index", "seg_edge_attr"),
+    "use_tracklets": ("tracklet_x", "tracklet_edge_index", "tracklet_edge_attr"),
+}
+DV_OUTPUT_FORMATS = ("packed", "h5", "both")
+
+
+def is_packed_part(path) -> bool:
+    return os.path.isfile(os.path.join(str(path), "meta.json"))
+
+
+def data_part_stem(path) -> str:
+    """Part name without .h5 / .packed: an H5 part and its packed twin compare equal."""
+    name = os.path.basename(str(path).rstrip("/"))
+    for suffix in (DV_PACKED_SUFFIX, ".h5"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def read_packed_meta(part_dir) -> dict:
+    import json
+    with open(os.path.join(str(part_dir), "meta.json")) as f:
+        return json.load(f)
+
+
+def _as_numpy(v):
+    return v.numpy() if hasattr(v, "numpy") and not isinstance(v, np.ndarray) else np.asarray(v)
+
+
+class PackedPartWriter:
+    """Stream events into one packed part (block data appended to raw files, assembled into .npy files on close; the
+    part appears atomically by a rename). Events are dicts with the blocks (numpy arrays or tensors) plus y,
+    n_muon_nodes, event_key, dataset_name, root_file; the blocks of the first event fix those of the part."""
+
+    def __init__(self, part_dir):
+        import shutil
+        self.part_dir = str(part_dir).rstrip("/")
+        self.tmp = f"{self.part_dir}.tmp{os.getpid()}"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp)
+        self.blocks = None
+        self._cols = {}
+        self._files = {}
+        self._lens = {}
+        self._per_event = {"y": [], "n_muon_nodes": [], "event_key": [], "dataset_name": [], "root_file": []}
+
+    def _raw(self, name: str) -> str:
+        return os.path.join(self.tmp, name + ".raw")
+
+    def add(self, ev: dict) -> None:
+        present = [b for b in DV_PACKED_BLOCKS if ev.get(b) is not None]
+        if self.blocks is None:
+            self.blocks = present
+            for b in self.blocks:
+                self._lens[b] = []
+                if DV_PACKED_BLOCKS[b] is None:
+                    self._files[b] = (open(self._raw(b + ".r0"), "wb"), open(self._raw(b + ".r1"), "wb"))
+                else:
+                    a = _as_numpy(ev[b])
+                    self._cols[b] = int(a.shape[1]) if a.ndim == 2 and a.shape[1] > 0 else DV_PACKED_BLOCKS[b]
+                    self._files[b] = (open(self._raw(b), "wb"),)
+        elif present != self.blocks:
+            raise RuntimeError(f"event {ev.get('event_key')}: blocks {present} differ from the part's {self.blocks}")
+        for b in self.blocks:
+            a = _as_numpy(ev[b])
+            if DV_PACKED_BLOCKS[b] is None:
+                # same layout as H5EventDataset: edge_index transposed if stored [E, 2], the others reshaped
+                if b == "edge_index" and a.ndim == 2 and a.shape[0] != 2:
+                    a = a.T
+                a = a.reshape(2, -1).astype(np.int64)
+                if a.size and (a.min() < 0 or a.max() > np.iinfo(np.int32).max):
+                    raise RuntimeError(f"{b} of event {ev.get('event_key')} does not fit int32")
+                a = a.astype(np.int32)
+                a[0].tofile(self._files[b][0])
+                a[1].tofile(self._files[b][1])
+                self._lens[b].append(a.shape[1])
+            else:
+                a = np.ascontiguousarray(a.astype(np.float32).reshape(-1, self._cols[b]))
+                a.tofile(self._files[b][0])
+                self._lens[b].append(a.shape[0])
+        self._per_event["y"].append(float(np.asarray(_as_numpy(ev["y"])).reshape(-1)[0]))
+        self._per_event["n_muon_nodes"].append(int(np.asarray(_as_numpy(ev["n_muon_nodes"])).reshape(-1)[0]))
+        self._per_event["event_key"].append(str(ev["event_key"]))
+        for k in ("dataset_name", "root_file"):
+            v = ev.get(k)
+            self._per_event[k].append("unknown" if v is None else str(v))
+
+    def _assemble(self, b: str) -> None:
+        n = int(np.sum(self._lens[b], dtype=np.int64))
+        np.save(os.path.join(self.tmp, f"{b}_ptr.npy"),
+                np.concatenate([[0], np.cumsum(self._lens[b], dtype=np.int64)]).astype(np.int64))
+        path = os.path.join(self.tmp, f"{b}.npy")
+        if DV_PACKED_BLOCKS[b] is None:
+            out = np.lib.format.open_memmap(path, mode="w+", dtype=np.int32, shape=(2, n))
+            for r in (0, 1):
+                if n:
+                    out[r] = np.memmap(self._raw(f"{b}.r{r}"), dtype=np.int32, mode="r", shape=(n,))
+                os.remove(self._raw(f"{b}.r{r}"))
+        else:
+            out = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(n, self._cols[b]))
+            if n:
+                out[:] = np.memmap(self._raw(b), dtype=np.float32, mode="r", shape=(n, self._cols[b]))
+            os.remove(self._raw(b))
+        out.flush()
+        del out
+
+    def close(self, meta: dict | None = None) -> dict:
+        import json
+        import shutil
+        for fhs in self._files.values():
+            for fh in fhs:
+                fh.close()
+        for b in self.blocks or []:
+            self._assemble(b)
+        np.save(os.path.join(self.tmp, "y.npy"), np.asarray(self._per_event["y"], dtype=np.float32))
+        np.save(os.path.join(self.tmp, "n_muon_nodes.npy"), np.asarray(self._per_event["n_muon_nodes"], dtype=np.int64))
+        for k in ("event_key", "dataset_name", "root_file"):
+            np.save(os.path.join(self.tmp, f"{k}.npy"), np.asarray(self._per_event[k], dtype=str))
+        out_meta = {"format": DV_PACKED_FORMAT, "n_events": len(self._per_event["y"]), "blocks": list(self.blocks or [])}
+        out_meta.update(meta or {})
+        with open(os.path.join(self.tmp, "meta.json"), "w") as f:
+            json.dump(out_meta, f, indent=1)
+        shutil.rmtree(self.part_dir, ignore_errors=True)
+        os.replace(self.tmp, self.part_dir)
+        return out_meta
+
+    def abort(self) -> None:
+        import shutil
+        for fhs in self._files.values():
+            for fh in fhs:
+                fh.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def iter_packed_events(part_dir, blocks=None, max_events: int = -1):
+    """Events of a packed part as numpy dicts (blocks + y, n_muon_nodes, event_key, dataset_name, root_file)."""
+    meta = read_packed_meta(part_dir)
+    blocks = list(meta["blocks"]) if blocks is None else [b for b in blocks if b in meta["blocks"]]
+    arr = {b: np.load(os.path.join(str(part_dir), f"{b}.npy"), mmap_mode="r") for b in blocks}
+    ptr = {b: np.load(os.path.join(str(part_dir), f"{b}_ptr.npy")) for b in blocks}
+    per_event = {k: np.load(os.path.join(str(part_dir), f"{k}.npy"))
+                 for k in ("y", "n_muon_nodes", "event_key", "dataset_name", "root_file")}
+    n = int(meta["n_events"]) if max_events < 0 else min(int(meta["n_events"]), int(max_events))
+    for e in range(n):
+        ev = {k: v[e] for k, v in per_event.items()}
+        for b in blocks:
+            s, t = int(ptr[b][e]), int(ptr[b][e + 1])
+            ev[b] = np.array(arr[b][:, s:t] if DV_PACKED_BLOCKS[b] is None else arr[b][s:t])
+        yield ev
+
+
+def dv_output_paths(output_path: str, output_format: str) -> tuple:
+    """(H5 path or None, packed part or None) of a conversion output, from either kind of path."""
+    if output_format not in DV_OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {DV_OUTPUT_FORMATS}, got {output_format!r}")
+    base = os.path.join(os.path.dirname(str(output_path)), data_part_stem(output_path))
+    h5_path = (str(output_path) if str(output_path).endswith(".h5") else base + ".h5") if output_format != "packed" else None
+    packed_path = base + DV_PACKED_SUFFIX if output_format != "h5" else None
+    return h5_path, packed_path
+
 
 def save_displaced_vertex_samples_to_hdf5(samples: list[dict], hdf5_path: str) -> None:
     """Save an in-memory list of DisplacedVertex classification samples to HDF5."""
@@ -1352,78 +2207,139 @@ def save_displaced_vertex_samples_to_hdf5(samples: list[dict], hdf5_path: str) -
             _write_dv_classification_event_group(events_grp.create_group(f"{i:07d}"), sample)
 
 
+def _dv_file_attrs(root_path: str, kwargs: dict) -> tuple:
+    """(file attributes, converter config, muon-node feature names) of a conversion: the self-describing schema."""
+    import inspect
+    import json
+    config = inspect.signature(iter_displaced_vertex_classification_samples).bind(root_path, **kwargs)
+    config.apply_defaults()
+    config = {k: v for k, v in config.arguments.items() if k != "root_path"}
+    attrs = {
+        "source_root": os.path.abspath(root_path),
+        "task": "graph_classification",
+        "label_definition": (
+            "0=background for non-signal-pattern files; "
+            "1=signal for signal-pattern files if any truth vertex satisfies "
+            "r_min_mm < rho < r_max_mm; signal-pattern events outside this window are skipped"
+        ),
+        "node_feature_names": json.dumps(DV_NODE_FEATURE_NAMES),
+        "edge_feature_names": json.dumps(DV_EDGE_FEATURE_NAMES),
+        "calo_sector_convention": str(config["calo_sector_convention"]),
+    }
+    if config["track_tree_name"]:
+        attrs["track_feature_names"] = json.dumps(TRACK_FEATURE_NAMES)
+        attrs["track_edge_feature_names"] = json.dumps(DV_EDGE_FEATURE_NAMES)
+    muon_names = list(DV_NODE_FEATURE_NAMES)
+    if config["segment_chi2_feature"]:
+        muon_names[5] = MUON_SLOT5_FEATURE_CHI2
+    attrs["muon_node_feature_names"] = json.dumps(muon_names)
+    if config["segment_edge_max_dr"] is not None and config["segment_edge_max_dr"] > 0:
+        attrs["segment_edge_feature_names"] = json.dumps(SEGMENT_EDGE_FEATURE_NAMES)
+    if config["tracklet_max_dr"] is not None and config["tracklet_max_dr"] > 0:
+        attrs["tracklet_feature_names"] = json.dumps(TRACKLET_FEATURE_NAMES)
+        attrs["tracklet_edge_feature_names"] = json.dumps(TRACKLET_EDGE_FEATURE_NAMES)
+    config_json = {k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
+                   if isinstance(v, (str, int, float, bool, list, tuple, type(None)))}
+    attrs["converter_config"] = json.dumps(config_json)
+    return attrs, config_json, muon_names
+
+
 def convert_displaced_vertex_root_file(
     root_path: str,
     output_path: str,
     overwrite: bool = False,
+    output_format: str = "h5",
     **kwargs,
 ) -> tuple[int, int, int]:
     """
-    Convert one ROOT file to one HDF5 file.
+    Convert one ROOT file to one HDF5 file (output_format="h5"), one packed part ("packed": <stem>.packed beside
+    output_path) or both, in one pass over the ROOT file.
 
     Returns ``(n_written, n_signal, n_background)``.
     """
-    if os.path.exists(output_path) and not overwrite:
-        print(f"Skipping {os.path.basename(root_path)} → already exists: {output_path}")
+    h5_path, packed_path = dv_output_paths(output_path, output_format)
+    outputs = [p for p in (h5_path, packed_path) if p is not None]
+    if not overwrite and all(os.path.exists(p) for p in outputs):
+        print(f"Skipping {os.path.basename(root_path)} → already exists: {', '.join(outputs)}")
         return 0, 0, 0
-
-    out_dir = os.path.dirname(output_path)
+    out_dir = os.path.dirname(outputs[0])
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    tmp_path = f"{output_path}.tmp"
-    if os.path.exists(tmp_path):
+    attrs, config_json, muon_names = _dv_file_attrs(root_path, kwargs)
+    tmp_path = f"{h5_path}.tmp" if h5_path else None
+    if tmp_path and os.path.exists(tmp_path):
         os.remove(tmp_path)
 
     n_written = 0
     n_signal = 0
     n_background = 0
-
+    h5 = None
+    packer = None
     try:
-        with h5py.File(tmp_path, "w") as h5:
-            h5.attrs["source_root"] = os.path.abspath(root_path)
-            h5.attrs["task"] = "graph_classification"
-            h5.attrs["label_definition"] = (
-                "0=background for non-signal-pattern files; "
-                "1=signal for signal-pattern files if any truth vertex satisfies "
-                "r_min_mm < rho < r_max_mm; signal-pattern events outside this window are skipped"
-            )
+        if h5_path:
+            h5 = h5py.File(tmp_path, "w")
+            for k, v in attrs.items():
+                h5.attrs[k] = v
             events_grp = h5.create_group("events")
+        if packed_path:
+            packer = PackedPartWriter(packed_path)
 
-            for sample in iter_displaced_vertex_classification_samples(root_path, **kwargs):
-                label = int(np.asarray(sample["y"]).ravel()[0])
-                if label == 1:
-                    n_signal += 1
-                else:
-                    n_background += 1
+        for sample in iter_displaced_vertex_classification_samples(root_path, **kwargs):
+            label = int(np.asarray(sample["y"]).ravel()[0])
+            if label == 1:
+                n_signal += 1
+            else:
+                n_background += 1
+            key = f"{n_written:07d}"
+            if h5 is not None:
+                _write_dv_classification_event_group(events_grp.create_group(key), sample)
+            if packer is not None:
+                packer.add({**sample, "event_key": key})
+            n_written += 1
 
-                g = events_grp.create_group(f"{n_written:07d}")
-                _write_dv_classification_event_group(g, sample)
-                n_written += 1
-
+        if h5 is not None:
             h5.attrs["n_events_written"] = int(n_written)
             h5.attrs["n_signal"] = int(n_signal)
             h5.attrs["n_background"] = int(n_background)
-
-        os.replace(tmp_path, output_path)
+            h5.close()
+            h5 = None
+            os.replace(tmp_path, h5_path)
+        if packer is not None:
+            st = os.stat(root_path)
+            packer.close(meta={
+                "source": os.path.basename(root_path), "source_size": st.st_size, "source_mtime_ns": st.st_mtime_ns,
+                "converter_config": config_json, "muon_node_feature_names": muon_names, "file_attrs": attrs,
+                "n_signal": int(n_signal), "n_background": int(n_background),
+            })
+            packer = None
         print(
-            f"Saved {n_written} graphs to {output_path} "
+            f"Saved {n_written} graphs to {', '.join(outputs)} "
             f"(signal={n_signal}, background={n_background})"
         )
         return n_written, n_signal, n_background
 
-    except Exception:
-        if os.path.exists(tmp_path):
+    except BaseException:
+        if h5 is not None:
+            h5.close()
+        if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+        if packer is not None:
+            packer.abort()
         raise
 
 
 def add_dv_classification_converter_args(ap):
     """Add command-line options for ``DisplacedVertex.py``."""
     ap.add_argument("--dir-in", "--input-dir", dest="dir_in", required=True, help="Directory with ROOT files")
-    ap.add_argument("--dir-out", "--output-dir", dest="dir_out", required=True, help="Directory for per-file HDF5 outputs")
+    ap.add_argument("--dir-out", "--output-dir", dest="dir_out", required=True, help="Directory for the per-file outputs (packed parts and/or H5)")
     ap.add_argument("--pattern", default="*.root", help="Input ROOT glob pattern inside dir-in")
     ap.add_argument("--overwrite", action="store_true", help="Re-create HDF5 files even when they already exist")
+    ap.add_argument("--output-format", choices=DV_OUTPUT_FORMATS, default="packed",
+                    help="packed (default): <stem>.packed parts, the fast training input (train with --data-glob "
+                         "\"<dir-out>/*.packed\"; splitter, preproc and evaluation read them too); h5: the gzip H5 "
+                         "parts with the diagnostics (phi, eta, vertex_rho_mm, ...) needed by the event viewers; "
+                         "both: H5 and packed in one pass")
     ap.add_argument("--max-events-per-file", type=int, default=-1, help="Optional cap per ROOT file (-1 = all usable events)")
 
     ap.add_argument("--muon-tree-name", default="MuonBucketDump")
@@ -1436,14 +2352,53 @@ def add_dv_classification_converter_args(ap):
     ap.add_argument("--signal-r-min-mm", type=float, default=800.0)
     ap.add_argument("--signal-r-max-mm", type=float, default=8000.0)
 
-    ap.add_argument("--sector-mod", type=int, default=16)
+    ap.add_argument("--sector-mod", type=int, default=16, help="Number of phi bins of the legacy calo sector convention")
+    ap.add_argument("--calo-sector-convention", choices=CALO_SECTOR_CONVENTIONS, default="cpp",
+                    help="Sector of the calo nodes for the same_sector edge feature. cpp (default): MS sector number "
+                         "as in DVInferenceToolBase (comparable with the muon bucket sector); legacy: old phi bin "
+                         "(same_sector always 0 for muon-calo edges, reproduces the old datasets)")
     ap.add_argument("--min-tower-energy-mev", type=float, default=1000.0)
     ap.add_argument("--max-tower-segment-dr", type=float, default=0.4)
     ap.add_argument("--calo-r-max-mm", type=float, default=4250.0)
     ap.add_argument("--calo-z-max-mm", type=float, default=6500.0)
     ap.add_argument("--min-segments", type=int, default=1, help="Minimum muon segments required to keep an event")
     ap.add_argument("--require-edges", action="store_true", help="Skip graphs with no segment↔tower edges")
+
+    ap.add_argument("--track-tree-name", default="TrigFSTrackDump",
+                    help="Inner-tracker track tree (TrigFSTrackDump, TrigRoITrackDump or IDTrackDump; same branches). "
+                         "Empty string: no track block. Files without the tree get an empty track block.")
+    ap.add_argument("--min-track-pt-mev", type=float, default=2000.0,
+                    help="Minimum track pT for a track node (the dumper keeps pT > 1 GeV)")
+    ap.add_argument("--max-track-segment-dr", type=float, default=0.3,
+                    help="Track nodes and track-segment edges for deltaR(track, segment) below this value "
+                         "(the dumper cone is dR < 0.3: larger values have no effect)")
+    ap.add_argument("--max-track-dz0sintheta-mm", type=float, default=-1.0,
+                    help="Keep only tracks with |(z0 + vz - z_PV) sin(theta)| <= this value (< 0: no cut, default)")
+
+    seg = ap.add_argument_group("segment blocks (all on by default; the --no-* options reproduce the older graphs)")
+    seg.add_argument("--no-segment-chi2-feature", dest="segment_chi2_feature", action="store_false", default=True,
+                     help="Keep muon-node feature 5 at 0 instead of the segment chi2 / max(nDoF, 1)")
+    seg.add_argument("--no-segment-edges", dest="segment_edges", action="store_false", default=True,
+                     help="No segment-segment edges (seg_edge_index, seg_edge_attr; deltaR < --segment-edge-max-dr)")
+    seg.add_argument("--segment-edge-max-dr", type=float, default=0.4)
+    seg.add_argument("--no-tracklets", dest="tracklets", action="store_false", default=True,
+                     help="No MS tracklet nodes (tracklet_x, tracklet_edge_index, tracklet_edge_attr)")
+    seg.add_argument("--tracklet-max-dr", type=float, default=0.4, help="deltaR of a tracklet link")
+    seg.add_argument("--tracklet-max-chord-angle", type=float, default=0.2,
+                     help="Maximum r-z angle between the segment directions and the chord of a tracklet link [rad]")
+    seg.add_argument("--tracklet-min-layers", type=int, default=2, help="Minimum distinct station layers of a tracklet")
     return ap
+
+
+def segment_block_kwargs_from_args(args) -> dict:
+    """Converter keyword arguments of the optional segment blocks from add_dv_classification_converter_args options."""
+    return {
+        "segment_chi2_feature": bool(args.segment_chi2_feature),
+        "segment_edge_max_dr": float(args.segment_edge_max_dr) if args.segment_edges else -1.0,
+        "tracklet_max_dr": float(args.tracklet_max_dr) if args.tracklets else -1.0,
+        "tracklet_max_chord_angle": float(args.tracklet_max_chord_angle),
+        "tracklet_min_layers": int(args.tracklet_min_layers),
+    }
 
 
 def run_dv_directory_conversion(args) -> None:
@@ -1461,9 +2416,9 @@ def run_dv_directory_conversion(args) -> None:
         file_name = os.path.basename(root_path)
         sample_name = os.path.splitext(file_name)[0]
         output_path = os.path.join(args.dir_out, f"{sample_name}.h5")
-
-        if os.path.exists(output_path) and not args.overwrite:
-            print(f"Skipping {file_name} → already exists: {output_path}")
+        outputs = [q for q in dv_output_paths(output_path, args.output_format) if q is not None]
+        if all(os.path.exists(q) for q in outputs) and not args.overwrite:
+            print(f"Skipping {file_name} → already exists: {', '.join(outputs)}")
             continue
 
         print(f"Processing {file_name}")
@@ -1472,6 +2427,7 @@ def run_dv_directory_conversion(args) -> None:
                 root_path=root_path,
                 output_path=output_path,
                 overwrite=args.overwrite,
+                output_format=args.output_format,
                 muon_tree_name=args.muon_tree_name,
                 calo_tree_name=args.calo_tree_name,
                 vertex_tree_name=args.vertex_tree_name,
@@ -1486,6 +2442,12 @@ def run_dv_directory_conversion(args) -> None:
                 min_segments=args.min_segments,
                 require_edges=args.require_edges,
                 max_events=args.max_events_per_file,
+                track_tree_name=args.track_tree_name,
+                min_track_pt_mev=args.min_track_pt_mev,
+                max_track_segment_dr=args.max_track_segment_dr,
+                max_track_dz0_sintheta_mm=args.max_track_dz0sintheta_mm,
+                calo_sector_convention=args.calo_sector_convention,
+                **segment_block_kwargs_from_args(args),
             )
             total_written += n_written
             total_signal += n_signal

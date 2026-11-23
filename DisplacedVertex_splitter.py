@@ -25,6 +25,8 @@ from typing import List, Tuple
 import h5py
 import numpy as np
 
+from dv_converter_utils import is_packed_part
+
 
 def _decode_h5_attr(v):
     if isinstance(v, bytes):
@@ -56,6 +58,16 @@ def _read_event_metadata(paths: List[str]) -> Tuple[np.ndarray, np.ndarray, np.n
     event_refs = []
 
     for file_idx, p in enumerate(paths):
+        if is_packed_part(p):  # packed part (DisplacedVertex_converter.py --output-format packed): per-event arrays
+            keys = np.load(Path(p) / "event_key.npy")
+            y = np.load(Path(p) / "y.npy").astype(np.float32)
+            if not np.all((y == 0.0) | (y == 1.0)):
+                raise RuntimeError(f"Expected labels 0/1 in {p}")
+            labels.extend(y.tolist())
+            dataset_names.extend(str(v) for v in np.load(Path(p) / "dataset_name.npy"))
+            root_files.extend(str(v) for v in np.load(Path(p) / "root_file.npy"))
+            event_refs.extend((file_idx, str(k)) for k in keys)
+            continue
         with h5py.File(p, "r") as f:
             if "events" not in f:
                 continue
@@ -126,7 +138,7 @@ def _random_split_indices(n: int, val_fraction: float, rng: np.random.RandomStat
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-glob", required=True, help='Glob for H5 files, e.g. "./data/*.h5"')
+    ap.add_argument("--data-glob", required=True, help='Glob for the H5 files or packed parts, e.g. "./data/*.packed"')
     ap.add_argument("--val-fraction", type=float, default=0.1, help="Fraction of events used for validation")
     ap.add_argument("--seed", type=int, default=12345, help="Random seed for deterministic split")
     ap.add_argument("--out", required=True, help="Output split file (.npz)")
@@ -140,8 +152,8 @@ def main():
 
     paths = sorted(glob.glob(args.data_glob))
     if not paths:
-        raise SystemExit(f"No H5 files matched: {args.data_glob}")
-    print(f"[i] found {len(paths)} H5 files")
+        raise SystemExit(f"No files matched: {args.data_glob}")
+    print(f"[i] found {len(paths)} parts")
 
     labels, dataset_names, root_files, event_refs = _read_event_metadata(paths)
     n = int(labels.size)

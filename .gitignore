@@ -8,6 +8,7 @@ __pycache__/
 .asetup.save
 athena/
 build/
+tests/
 BucketDumperConfigs/athena/
 BucketDumperConfigs/build/
 BucketDumperConfigs/data*/
@@ -33,6 +34,7 @@ wandb/
 *save
 *new
 *old
+*log
 *.txt
 feynman_*
 onnx_eval_*

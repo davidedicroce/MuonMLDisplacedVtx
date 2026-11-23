@@ -15,36 +15,52 @@ no H5-level normalization is performed by the DataLoader.
 The trainer is expected to print lines like:
 [epoch 001] ... | val loss=... acc=... precision=... recall=... f1=... bacc=... auc=... tpr_at_target_fpr=... fpr_at_target_fpr=... thr_at_target_fpr=... | ...
 
+Search space (defaults) = the 80 completed fast trials of tuning_dv_classifier_edge,
+narrowed around their top 20% and around the best model (edge_gatv2.onnx,
+gat_residual + GATv2 edge attention, ROC AUC 0.977 vs 0.958 for the best refit):
+  fixed   : layer_type=gat_residual, gatv2_edge_attn, pool=meanmax, fourier=False,
+            pos_weight=auto (16/16 of the top-20% trials), normalized node/edge features
+  dropped : loss bce_smooth (0/16 in the top 20%), hidden_dim 64 (0/16)
+  narrowed: lr, weight_decay, dropout, feat_noise_std, label_smoothing, focal_gamma,
+            asym_gamma_pos/neg; layers 3-6, hidden_dim 128/256, gat_heads 2/4/8
+Pass "any" to --fixed-layer-type/--fixed-pool/--fixed-fourier/--fixed-pos-weight to
+search a knob again; the old wide ranges are in each flag's help.
+
+Trial 0 is a baseline: train_DisplacedVertex.py's own defaults (the best model). It is
+added on top of --n-trials, and --n-startup-trials random trials follow it.
+
+Architecture options of the trainer (GAT trials; the defaults keep the legacy model, the search space above was
+narrowed on it): --fixed-block legacy|prenorm, --fixed-relation-mp false|true, --fixed-edge-update
+none|seg|seg_tracklet (relation-mp trials), --fixed-readout global|typed|typed_attn ('any' searches one of them),
+plus the fixed knobs --ffn-mult, --grad-clip, --relation-aggr, --calo-context, --readout-heads. For a comparison of
+the options fix one at a time; deeper prenorm stacks: --layers-max 8. The baseline trial keeps the trainer defaults
+(it lies outside a study with other fixed options and then runs without Optuna params).
+
 Example:
-python tune_DisplacedVertex_optuna.py \
-  --train-script ./train_DisplacedVertex.py \
-  --data-glob "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/*.h5" \
-  --split-file "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/split_displaced_vertex_seed12345.npz" \
-  --feature-stats-json "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json" \
-  --normalize-node-features \
-  --normalize-edge-features \
-  --out-dir "/shared/wp2p5/models/tuning_dv_classifier_edge" \
-  --study-name "/shared/wp2p5/sqlite/dv_classifier_edge" \
-  --fixed-layer-type edge_residual \
-  --compare-metric val_tpr_at_target_fpr \
-  --target-fpr 0.01 \
-  --loss-types bce bce_smooth focal asymmetric_focal \
-  --n-trials 200 \
-  --fast-epochs 60 \
-  --fast-gpus-per-trial 2 \
-  --n-jobs 4 \
-  --fast-max-train-events 50000 \
-  --refit-max-train-events -1 \
-  --refit-top-k 5 \
-  --refit-epochs 200 \
-  --refit-gpus-per-trial 8 \
-  --num-workers 4 \
-  --pin-memory \
-  --wandb-mode disabled \
-2>&1 | tee log_tune_dv_classifier_edge.txt              
+TUNE_FLAGS=(
+  --train-script ./train_DisplacedVertex.py
+  --data-glob "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/*.h5"
+  --split-file "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/split_displaced_vertex_seed12345.npz"
+  --feature-stats-json "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json"
+  --out-dir "/shared/wp2p5/models/tuning_dv_classifier_gatv2"
+  --study-name dv_classifier_gatv2
+  --compare-metric val_tpr_at_target_fpr --target-fpr 0.01
+  --num-workers 4 --pin-memory --wandb-mode disabled
+)
+python -u tune_DisplacedVertex_optuna.py "${TUNE_FLAGS[@]}" \
+  --n-trials 120 --n-startup-trials 60 \
+  --fast-epochs 60 --fast-max-train-events 100000 \
+  --fast-gpus-per-trial 2 --n-jobs 4 \
+  --refit-top-k 0 2>&1 | tee -a log_tune_dv_classifier_gatv2.txt
+
+# later: refit the best 5 on the full train split (same study, same flags)
+python -u tune_DisplacedVertex_optuna.py "${TUNE_FLAGS[@]}" \
+  --refit-only --refit-top-k 5 --refit-epochs 200 \
+  --refit-gpus-per-trial 8 2>&1 | tee -a log_tune_dv_classifier_gatv2_refit.txt
 """
 
 import argparse
+import ast
 from datetime import datetime
 import glob
 import json
@@ -122,6 +138,16 @@ METRICS = (
 )
 
 LOSS_TYPES = ("bce", "bce_smooth", "focal", "asymmetric_focal")
+
+# Architecture options of the trainer (dv_training_utils BLOCK_TYPES / EDGE_UPDATE_MODES / READOUT_TYPES ...)
+BLOCK_CHOICES = ("legacy", "prenorm")
+EDGE_UPDATE_CHOICES = ("none", "seg", "seg_tracklet")
+READOUT_CHOICES = ("global", "typed", "typed_attn")
+# trainer defaults = the legacy model (used when the train script predates these options)
+ARCH_LEGACY_DEFAULTS = {
+    "block": "legacy", "ffn_mult": 2, "grad_clip": 0.0, "relation_mp": False, "relation_aggr": "attn_max",
+    "calo_context": "two_way", "edge_update": "none", "readout": "global", "readout_heads": 4,
+}
 
 
 def now_utc_compact() -> str:
@@ -314,6 +340,33 @@ def extract_objective_from_ckpt(ckpt_info: Dict[str, Any], compare_metric: str) 
     return None
 
 
+def _edge_update_choices(args: argparse.Namespace) -> List[str]:
+    """Edge-state options the graphs of this study allow."""
+    if not getattr(args, "use_segment_edges", True):
+        return ["none"]
+    return [c for c in EDGE_UPDATE_CHOICES if c != "seg_tracklet" or getattr(args, "use_tracklets", True)]
+
+
+def _arch_hparams(args: argparse.Namespace, h: Dict[str, Any], pick) -> None:
+    """Trainer architecture options into h. pick(name, choices, fixed, default) gives the fixed value when it is not
+    None, else the trial's choice (suggested for a new trial, read from the params for a refit). Only GAT trials get
+    the non-legacy options; edge_update / calo_context only with relation_mp."""
+    is_gat = h["layer_type"] == "gat_residual"
+    h["block"] = pick("block", list(BLOCK_CHOICES), args.fixed_block, "legacy") if is_gat else "legacy"
+    h["relation_mp"] = bool(pick("relation_mp", [False, True], args.fixed_relation_mp, False)) if is_gat else False
+    if h["relation_mp"]:
+        h["edge_update"] = pick("edge_update", _edge_update_choices(args), args.fixed_edge_update, "none")
+        h["calo_context"] = args.calo_context
+    else:
+        h["edge_update"] = "none"
+        h["calo_context"] = "two_way"
+    h["readout"] = pick("readout", list(READOUT_CHOICES), args.fixed_readout, "global")
+    h["readout_heads"] = int(args.readout_heads) if h["hidden_dim"] % int(args.readout_heads) == 0 else 4
+    h["ffn_mult"] = int(args.ffn_mult)
+    h["grad_clip"] = float(args.grad_clip)
+    h["relation_aggr"] = args.relation_aggr
+
+
 def _suggest_loss_hparams(trial: optuna.Trial, args: argparse.Namespace, h: Dict[str, Any]) -> None:
     h["loss_type"] = args.fixed_loss_type or trial.suggest_categorical("loss_type", list(args.loss_types))
 
@@ -359,7 +412,7 @@ def build_hparams(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, An
     h["fourier"] = args.fixed_fourier if args.fixed_fourier is not None else trial.suggest_categorical("fourier", [True, False])
     h["pos_weight"] = args.fixed_pos_weight or trial.suggest_categorical("pos_weight", ["auto", "none"])
     if h["layer_type"] == "gat_residual":
-        h["gat_heads"] = trial.suggest_categorical("gat_heads", [2, 4, 8])
+        h["gat_heads"] = trial.suggest_categorical("gat_heads", list(args.gat_heads_choices))
         if h["hidden_dim"] % h["gat_heads"] != 0:
             h["gat_heads"] = 4 if h["hidden_dim"] % 4 == 0 else 2
     else:
@@ -367,11 +420,15 @@ def build_hparams(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, An
     is_gat = h["layer_type"] == "gat_residual"
     h["gat_edge_attn"] = bool(args.gat_edge_attn and is_gat)
     h["gatv2_edge_attn"] = bool(args.gatv2_edge_attn and is_gat)
+    _arch_hparams(args, h, lambda name, choices, fixed, default:
+                  fixed if fixed is not None else trial.suggest_categorical(name, choices))
     _suggest_loss_hparams(trial, args, h)
     return h
 
 
 def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Namespace) -> Dict[str, Any]:
+    if is_baseline_trial(trial):
+        return dict(trial.user_attrs["hparams"])
     p = dict(trial.params)
     layer_type = args.fixed_layer_type or p.get("layer_type", "mpnn")
     is_gat = layer_type == "gat_residual"
@@ -397,7 +454,168 @@ def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Nam
         "asym_gamma_pos": p.get("asym_gamma_pos", 0.0),
         "asym_gamma_neg": p.get("asym_gamma_neg", 4.0),
     }
+    _arch_hparams(args, h, lambda name, choices, fixed, default: fixed if fixed is not None else p.get(name, default))
     return h
+
+
+# ----------------------------------------------------------------------------
+# Baseline trial 0: the train script's own defaults (the current best model),
+# read from its argparse calls without importing it.
+# ----------------------------------------------------------------------------
+def read_trainer_defaults(train_script: Path) -> Dict[str, Any]:
+    """dest -> default from add_argument(..., default=<literal>) in the train script and
+    the modules it imports from its own directory, then its ap.set_defaults(...)."""
+    train_script = Path(train_script)
+    tree = ast.parse(train_script.read_text(encoding="utf-8"))
+    trees = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            mod = train_script.parent / (node.module.replace(".", "/") + ".py")
+            if mod.is_file():
+                trees.append(ast.parse(mod.read_text(encoding="utf-8")))
+    trees.append(tree)  # the script last: its set_defaults win
+    defaults: Dict[str, Any] = {}
+    overrides: Dict[str, Any] = {}
+    for t in trees:
+        for node in ast.walk(t):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            if node.func.attr == "set_defaults":
+                for k, v in kw.items():
+                    overrides[k] = ast.literal_eval(v)
+                continue
+            if node.func.attr != "add_argument" or "default" not in kw:
+                continue
+            if "dest" in kw:
+                dest = ast.literal_eval(kw["dest"])
+            else:
+                flags = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                longs = [f for f in flags if f.startswith("--")]
+                if not longs:
+                    continue
+                dest = longs[0][2:].replace("-", "_")
+            defaults.setdefault(dest, ast.literal_eval(kw["default"]))
+    defaults.update(overrides)
+    return defaults
+
+
+def trainer_baseline_hparams(defaults: Dict[str, Any]) -> Dict[str, Any]:
+    """Trainer defaults in the tuner's hparams format."""
+    need = ["lr", "hidden_dim", "layers", "dropout", "weight_decay", "edge_dropout", "feat_noise_std",
+            "layer_type", "pool", "fourier", "pos_weight", "gat_heads", "gat_edge_attn", "gatv2_edge_attn",
+            "loss_type", "label_smoothing", "focal_gamma", "focal_alpha", "asym_gamma_pos", "asym_gamma_neg"]
+    missing = [k for k in need if k not in defaults]
+    if missing:
+        raise SystemExit(f"[baseline] train script has no default for {missing}")
+    h = {k: defaults[k] for k in need}
+    for k, v in ARCH_LEGACY_DEFAULTS.items():
+        h[k] = defaults.get(k, v)
+    fa = str(h["focal_alpha"])
+    h["focal_alpha"] = "none" if fa.lower() == "none" else float(fa)
+    h["pos_weight"] = str(h["pos_weight"])
+    return h
+
+
+def baseline_enqueue_params(h: Dict[str, Any], args: argparse.Namespace):
+    """Optuna params that make build_hparams() reproduce h in this study's search space,
+    or (None, reason) if the baseline lies outside it (then it runs without params)."""
+    p: Dict[str, Any] = {}
+
+    def fixed(name, value, fixed_value):
+        if fixed_value is None:
+            return True
+        return value == fixed_value
+
+    def flt(name, lo, hi):
+        if not (lo <= float(h[name]) <= hi):
+            raise ValueError(f"{name}={h[name]} outside [{lo}, {hi}]")
+        p[name] = float(h[name])
+
+    try:
+        flt("lr", args.lr_min, args.lr_max)
+        if h["hidden_dim"] not in args.hidden_dims:
+            raise ValueError(f"hidden_dim={h['hidden_dim']} not in {args.hidden_dims}")
+        p["hidden_dim"] = h["hidden_dim"]
+        if not (args.layers_min <= h["layers"] <= args.layers_max):
+            raise ValueError(f"layers={h['layers']} outside [{args.layers_min}, {args.layers_max}]")
+        p["layers"] = h["layers"]
+        flt("dropout", args.dropout_min, args.dropout_max)
+        flt("weight_decay", args.weight_decay_min, args.weight_decay_max)
+        flt("edge_dropout", args.edge_dropout_min, args.edge_dropout_max)
+        flt("feat_noise_std", args.feat_noise_min, args.feat_noise_max)
+        for name, fv, choices in (("layer_type", args.fixed_layer_type, ["mpnn", "sage_residual", "gat_residual", "edge_residual"]),
+                                  ("pool", args.fixed_pool, ["mean", "meanmax"]),
+                                  ("fourier", args.fixed_fourier, [True, False]),
+                                  ("pos_weight", args.fixed_pos_weight, ["auto", "none"])):
+            if fv is not None:
+                if h[name] != fv:
+                    raise ValueError(f"{name}={h[name]!r} but the study fixes {fv!r}")
+            elif h[name] in choices:
+                p[name] = h[name]
+            else:
+                raise ValueError(f"{name}={h[name]!r} not in {choices}")
+        is_gat = h["layer_type"] == "gat_residual"
+        if bool(h["gat_edge_attn"]) != bool(args.gat_edge_attn and is_gat) or \
+           bool(h["gatv2_edge_attn"]) != bool(args.gatv2_edge_attn and is_gat):
+            raise ValueError("GAT edge-attention flags differ from the study's")
+        if is_gat:
+            if h["gat_heads"] not in args.gat_heads_choices or h["hidden_dim"] % h["gat_heads"]:
+                raise ValueError(f"gat_heads={h['gat_heads']} not in {args.gat_heads_choices}")
+            p["gat_heads"] = h["gat_heads"]
+        # architecture options: categorical ones as Optuna params, the others must equal the study's fixed values
+        arch_cats = [("readout", args.fixed_readout, list(READOUT_CHOICES))]
+        if is_gat:
+            arch_cats += [("block", args.fixed_block, list(BLOCK_CHOICES)),
+                          ("relation_mp", args.fixed_relation_mp, [False, True])]
+            if h["relation_mp"]:
+                arch_cats.append(("edge_update", args.fixed_edge_update, _edge_update_choices(args)))
+        elif h["block"] != "legacy" or h["relation_mp"]:
+            raise ValueError(f"block={h['block']} / relation_mp={h['relation_mp']} need gat_residual")
+        if not h["relation_mp"] and (h["edge_update"] != "none" or h["calo_context"] != "two_way"):
+            raise ValueError("edge_update / calo_context need relation_mp")
+        for name, fv, choices in arch_cats:
+            if fv is not None:
+                if h[name] != fv:
+                    raise ValueError(f"{name}={h[name]!r} but the study fixes {fv!r}")
+            elif h[name] in choices:
+                p[name] = h[name]
+            else:
+                raise ValueError(f"{name}={h[name]!r} not in {choices}")
+        knobs = [("grad_clip", float(args.grad_clip))]
+        if h["block"] == "prenorm":
+            knobs.append(("ffn_mult", int(args.ffn_mult)))
+        if h["relation_mp"]:
+            knobs += [("relation_aggr", args.relation_aggr), ("calo_context", args.calo_context)]
+        if h["readout"] == "typed_attn":
+            knobs.append(("readout_heads", int(args.readout_heads)))
+        for name, study_value in knobs:
+            if h[name] != study_value:
+                raise ValueError(f"{name}={h[name]!r} but the study uses {study_value!r}")
+        lt = h["loss_type"]
+        if args.fixed_loss_type is not None:
+            if lt != args.fixed_loss_type:
+                raise ValueError(f"loss_type={lt} but the study fixes {args.fixed_loss_type}")
+        elif lt in args.loss_types:
+            p["loss_type"] = lt
+        else:
+            raise ValueError(f"loss_type={lt} not in {args.loss_types}")
+        if lt in ("bce_smooth", "focal", "asymmetric_focal"):
+            flt("label_smoothing", args.label_smoothing_min, args.label_smoothing_max)
+        if lt == "focal":
+            flt("focal_gamma", args.focal_gamma_min, args.focal_gamma_max)
+        if lt in ("focal", "asymmetric_focal"):
+            flt("focal_alpha", args.focal_alpha_min, args.focal_alpha_max)
+        if lt == "asymmetric_focal":
+            flt("asym_gamma_pos", args.asym_gamma_pos_min, args.asym_gamma_pos_max)
+            flt("asym_gamma_neg", args.asym_gamma_neg_min, args.asym_gamma_neg_max)
+    except ValueError as e:
+        return None, str(e)
+    return p, ""
+
+
+def is_baseline_trial(t) -> bool:
+    return bool(t.user_attrs.get("baseline"))
 
 
 def build_command(
@@ -472,6 +690,18 @@ def build_command(
         cmd += ["--gatv2-edge-attn"]
     else:
         cmd += ["--no-gatv2-edge-attn"]
+    arch = {k: hparams.get(k, v) for k, v in ARCH_LEGACY_DEFAULTS.items()}
+    cmd += [
+        "--block", str(arch["block"]),
+        "--ffn-mult", str(int(arch["ffn_mult"])),
+        "--grad-clip", str(float(arch["grad_clip"])),
+        "--relation-mp" if bool(arch["relation_mp"]) else "--no-relation-mp",
+        "--relation-aggr", str(arch["relation_aggr"]),
+        "--calo-context", str(arch["calo_context"]),
+        "--edge-update", str(arch["edge_update"]),
+        "--readout", str(arch["readout"]),
+        "--readout-heads", str(int(arch["readout_heads"])),
+    ]
     if max_train_events > 0:
         cmd += ["--max-train-events", str(int(max_train_events))]
     if args.feature_stats_json:
@@ -496,6 +726,12 @@ def build_command(
         cmd += ["--no-amp"]
     if args.no_ema:
         cmd += ["--no-ema"]
+    if getattr(args, "use_tracks", False):
+        cmd += ["--use-tracks"]
+    if not getattr(args, "use_segment_edges", True):
+        cmd += ["--no-use-segment-edges"]
+    if not getattr(args, "use_tracklets", True):
+        cmd += ["--no-use-tracklets"]
     if args.extra_train_args:
         cmd += shlex.split(args.extra_train_args)
     return cmd
@@ -568,6 +804,12 @@ def validate_inputs(args: argparse.Namespace) -> None:
     if not glob.glob(args.data_glob):
         raise SystemExit(f"data_glob matched 0 files: {args.data_glob}")
     if (args.normalize_node_features or args.normalize_edge_features) and not args.feature_stats_json:
+        # Same fallback as the trainer: normalization_stats_raw.json beside the split file.
+        default_stats = Path(args.split_file).resolve().parent / "normalization_stats_raw.json"
+        if default_stats.is_file():
+            args.feature_stats_json = str(default_stats)
+            print(f"[i] feature stats: {default_stats} (beside the split file)")
+    if (args.normalize_node_features or args.normalize_edge_features) and not args.feature_stats_json:
         raise SystemExit(
             "--feature-stats-json is required when --normalize-node-features or "
             "--normalize-edge-features is enabled; the trainer embeds these stats "
@@ -580,14 +822,17 @@ def validate_inputs(args: argparse.Namespace) -> None:
             "--gat-edge-attn and --gatv2-edge-attn select different GAT "
             "architectures and cannot be enabled together."
         )
-    if (args.gat_edge_attn or args.gatv2_edge_attn) and args.fixed_layer_type not in (
-        None,
-        "gat_residual",
-    ):
-        raise SystemExit(
-            "Edge-aware GAT attention flags require --fixed-layer-type gat_residual "
-            "or an unfixed layer-type search."
-        )
+    # The GAT edge-attention flags only reach GAT trials (build_hparams sets them per
+    # trial), so they are harmless with another --fixed-layer-type.
+    if args.fixed_relation_mp is False and args.fixed_edge_update not in ("none", None):
+        raise SystemExit("--fixed-edge-update needs relation-mp trials: add --fixed-relation-mp true (or any).")
+    if args.fixed_relation_mp is False and args.calo_context != "two_way":
+        raise SystemExit("--calo-context one_way needs relation-mp trials: add --fixed-relation-mp true (or any).")
+    if args.fixed_edge_update not in (None, "none") and args.fixed_edge_update not in _edge_update_choices(args):
+        raise SystemExit(f"--fixed-edge-update {args.fixed_edge_update} needs the segment-segment edges "
+                         "(and the tracklets for seg_tracklet).")
+    if args.gatv2_edge_attn is False and args.fixed_relation_mp is not False:
+        print("[i] note: --relation-mp trials use their own GATv2 attention (--no-gatv2-edge-attn does not apply)")
 
 def build_optuna_storage(args: argparse.Namespace, out_dir: Path):
     """
@@ -683,8 +928,9 @@ def main() -> None:
     ap.add_argument("--refit-max-train-events", type=int, default=-1)
     ap.add_argument("--refit-gpus-per-trial", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--batch-size", type=int, default=16,
-                    help="Graphs per GPU step passed to the trainer.")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="Graphs per GPU step passed to the trainer. Default: the train script's default "
+                         "(64, as the best model); the old studies used 16.")
     ap.add_argument("--max-open-h5-files", type=int, default=16,
                     help="Maximum HDF5 files open per trainer process.")
     ap.add_argument("--pin-memory", action="store_true", default=False)
@@ -692,10 +938,12 @@ def main() -> None:
     ap.add_argument("--feature-stats-json", default=None,
                     help="Stats JSON loaded by the trainer and embedded as model normalization buffers.")
     ap.add_argument("--feature-norm-kind", default="standard", choices=["standard", "robust"])
-    ap.add_argument("--normalize-node-features", action="store_true", default=False,
-                    help="Ask the trainer to normalize node features inside the model.")
-    ap.add_argument("--normalize-edge-features", action="store_true", default=False,
-                    help="Ask the trainer to normalize edge features inside the model.")
+    ap.add_argument("--normalize-node-features", action="store_true", default=True,
+                    help="Ask the trainer to normalize node features inside the model (default, as the best model).")
+    ap.add_argument("--no-normalize-node-features", dest="normalize_node_features", action="store_false")
+    ap.add_argument("--normalize-edge-features", action="store_true", default=True,
+                    help="Ask the trainer to normalize edge features inside the model (default, as the best model).")
+    ap.add_argument("--no-normalize-edge-features", dest="normalize_edge_features", action="store_false")
     ap.add_argument("--early-stop-patience", type=int, default=10)
     ap.add_argument("--master-port-base", type=int, default=29500)
     ap.add_argument("--save", default="dv_classifier.pt",
@@ -706,50 +954,93 @@ def main() -> None:
     ap.add_argument("--refit-only", action="store_true", default=False,
                     help="Skip fast Optuna optimization and only refit the current best completed trials.")
     ap.add_argument("--extra-train-args", default="", help="Extra quoted arguments appended to every train command")
+    ap.add_argument("--use-tracks", action="store_true", default=False,
+                    help="Train every trial with the track block of the graphs (train_DisplacedVertex.py --use-tracks)")
+    ap.add_argument("--no-use-segment-edges", dest="use_segment_edges", action="store_false", default=True,
+                    help="Train without the segment-segment edges (on by default)")
+    ap.add_argument("--no-use-tracklets", dest="use_tracklets", action="store_false", default=True,
+                    help="Train without the MS tracklet nodes (on by default)")
     ap.add_argument("--no-amp", action="store_true", default=False)
     ap.add_argument("--no-ema", action="store_true", default=False)
-    ap.add_argument("--lr-min", type=float, default=1e-5)
-    ap.add_argument("--lr-max", type=float, default=1e-3)
-    ap.add_argument("--hidden-dims", type=int, nargs="+", default=[64, 128, 256])
-    ap.add_argument("--layers-min", type=int, default=2)
+    ap.add_argument("--lr-min", type=float, default=5e-5, help="Old: 1e-5.")
+    ap.add_argument("--lr-max", type=float, default=6e-4, help="Old: 1e-3.")
+    ap.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256], help="Old: 64 128 256.")
+    ap.add_argument("--layers-min", type=int, default=3, help="Old: 2.")
     ap.add_argument("--layers-max", type=int, default=6)
     ap.add_argument("--dropout-min", type=float, default=0.0)
-    ap.add_argument("--dropout-max", type=float, default=0.3)
-    ap.add_argument("--weight-decay-min", type=float, default=1e-5)
-    ap.add_argument("--weight-decay-max", type=float, default=5e-2)
+    ap.add_argument("--dropout-max", type=float, default=0.12, help="Old: 0.3.")
+    ap.add_argument("--weight-decay-min", type=float, default=1e-6, help="Old: 1e-5.")
+    ap.add_argument("--weight-decay-max", type=float, default=2e-3, help="Old: 5e-2.")
     ap.add_argument("--edge-dropout-min", type=float, default=0.0)
     ap.add_argument("--edge-dropout-max", type=float, default=0.2)
-    ap.add_argument("--feat-noise-min", type=float, default=0.0)
-    ap.add_argument("--feat-noise-max", type=float, default=0.03)
-    ap.add_argument("--loss-types", nargs="+", default=list(LOSS_TYPES), choices=list(LOSS_TYPES),
-                    help="Loss functions Optuna may sample.")
+    ap.add_argument("--feat-noise-min", type=float, default=5e-4, help="Old: 0.")
+    ap.add_argument("--feat-noise-max", type=float, default=0.01, help="Old: 0.03.")
+    ap.add_argument("--loss-types", nargs="+", default=["bce", "focal", "asymmetric_focal"], choices=list(LOSS_TYPES),
+                    help="Loss functions Optuna may sample. Old: all four (bce_smooth: 0/16 in the top 20%%).")
     ap.add_argument("--fixed-loss-type", default=None, choices=list(LOSS_TYPES))
-    ap.add_argument("--label-smoothing-min", type=float, default=0.0)
+    ap.add_argument("--label-smoothing-min", type=float, default=0.01, help="Old: 0.")
     ap.add_argument("--label-smoothing-max", type=float, default=0.05)
     ap.add_argument("--focal-gamma-min", type=float, default=0.5)
-    ap.add_argument("--focal-gamma-max", type=float, default=5.0)
+    ap.add_argument("--focal-gamma-max", type=float, default=2.0, help="Old: 5.")
     ap.add_argument("--focal-alpha-min", type=float, default=0.1)
     ap.add_argument("--focal-alpha-max", type=float, default=0.9)
     ap.add_argument("--asym-gamma-pos-min", type=float, default=0.0)
-    ap.add_argument("--asym-gamma-pos-max", type=float, default=2.0)
+    ap.add_argument("--asym-gamma-pos-max", type=float, default=1.0, help="Old: 2.")
     ap.add_argument("--asym-gamma-neg-min", type=float, default=1.0)
-    ap.add_argument("--asym-gamma-neg-max", type=float, default=6.0)
-    ap.add_argument("--fixed-layer-type", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"], default=None)
+    ap.add_argument("--asym-gamma-neg-max", type=float, default=3.5, help="Old: 6.")
+    ap.add_argument("--fixed-layer-type", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual", "any"],
+                    default="gat_residual", help="'any' searches the layer type (old default).")
     ap.add_argument("--gat-edge-attn", action="store_true", default=False,
                     help="Enable edge_attr encoder in GAT attention logits for all GAT trials.")
     ap.add_argument(
         "--gatv2-edge-attn",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Enable nonlinear source-destination-edge GATv2 attention for all "
-            "GAT trials."
+            "GAT trials (default, as the best model)."
         ),
     )
-    ap.add_argument("--fixed-pool", choices=["mean", "max", "sum", "meanmax"], default=None)
-    ap.add_argument("--fixed-fourier", type=lambda s: s.lower() in ("1", "true", "yes", "y"), default=None)
-    ap.add_argument("--fixed-pos-weight", default=None)
+    ap.add_argument("--no-gatv2-edge-attn", dest="gatv2_edge_attn", action="store_false")
+    ap.add_argument("--gat-heads-choices", type=int, nargs="+", default=[2, 4, 8])
+    ap.add_argument("--fixed-pool", choices=["mean", "max", "sum", "meanmax", "any"], default="meanmax",
+                    help="'any' searches mean/meanmax (old default).")
+    ap.add_argument("--fixed-fourier", default="false",
+                    help="true/false, or 'any' to search it (old default).")
+    ap.add_argument("--fixed-pos-weight", default="auto", help="auto/none, or 'any' to search it (old default).")
+    ap.add_argument("--baseline-trial", dest="baseline_trial", action="store_true", default=True,
+                    help="Trial 0 = train script defaults (the best model); added on top of --n-trials.")
+    ap.add_argument("--no-baseline-trial", dest="baseline_trial", action="store_false")
+    # Architecture options of the trainer (GAT trials; the defaults give the legacy model). 'any' searches an option.
+    ap.add_argument("--fixed-block", choices=list(BLOCK_CHOICES) + ["any"], default="legacy",
+                    help="Trainer --block for all GAT trials: legacy or prenorm (pre-LayerNorm blocks + FFN).")
+    ap.add_argument("--ffn-mult", type=int, default=2, help="Trainer --ffn-mult (prenorm feed-forward width).")
+    ap.add_argument("--grad-clip", type=float, default=0.0, help="Trainer --grad-clip for all trials (<= 0: off).")
+    ap.add_argument("--fixed-relation-mp", default="false",
+                    help="true/false: trainer --relation-mp (relation-typed message passing) for all GAT trials, "
+                         "or 'any' to search it.")
+    ap.add_argument("--relation-aggr", choices=["attn", "attn_max"], default="attn_max",
+                    help="Trainer --relation-aggr (relation-mp trials).")
+    ap.add_argument("--calo-context", choices=["two_way", "one_way"], default="two_way",
+                    help="Trainer --calo-context (relation-mp trials).")
+    ap.add_argument("--fixed-edge-update", choices=list(EDGE_UPDATE_CHOICES) + ["any"], default="none",
+                    help="Trainer --edge-update for the relation-mp trials (hidden segment / tracklet edge states).")
+    ap.add_argument("--fixed-readout", choices=list(READOUT_CHOICES) + ["any"], default="global",
+                    help="Trainer --readout for all trials: global, typed (per node type) or typed_attn.")
+    ap.add_argument("--readout-heads", type=int, default=4, help="Trainer --readout-heads (typed_attn trials).")
     args = ap.parse_args()
+    for name in ("fixed_layer_type", "fixed_pool", "fixed_pos_weight", "fixed_block", "fixed_edge_update",
+                 "fixed_readout"):
+        if getattr(args, name) == "any":
+            setattr(args, name, None)
+    args.fixed_fourier = None if str(args.fixed_fourier).lower() == "any" else \
+        str(args.fixed_fourier).lower() in ("1", "true", "yes", "y")
+    args.fixed_relation_mp = None if str(args.fixed_relation_mp).lower() == "any" else \
+        str(args.fixed_relation_mp).lower() in ("1", "true", "yes", "y")
+    trainer_defaults = read_trainer_defaults(Path(args.train_script))
+    if args.batch_size is None:
+        args.batch_size = int(trainer_defaults.get("batch_size", 16))
+    args.baseline_hparams = trainer_baseline_hparams(trainer_defaults)
 
     out_dir = Path(args.out_dir).resolve()
     mkdir(out_dir)
@@ -774,6 +1065,27 @@ def main() -> None:
     print(f"[i] visible GPUs: {devices if devices else 'none; running train script without torchrun'}")
     print(f"[i] objective: {args.compare_metric}; target_fpr={args.target_fpr}")
     print(f"[i] loss search space: {args.loss_types if not args.fixed_loss_type else [args.fixed_loss_type]}")
+    print(f"[i] search space: lr [{args.lr_min:g}, {args.lr_max:g}] log | hidden {args.hidden_dims} | "
+          f"layers [{args.layers_min}, {args.layers_max}] | dropout [{args.dropout_min:g}, {args.dropout_max:g}] | "
+          f"wd [{args.weight_decay_min:g}, {args.weight_decay_max:g}] log | edge_dropout "
+          f"[{args.edge_dropout_min:g}, {args.edge_dropout_max:g}] | feat_noise [{args.feat_noise_min:g}, {args.feat_noise_max:g}] | "
+          f"label_smoothing [{args.label_smoothing_min:g}, {args.label_smoothing_max:g}] | focal_gamma "
+          f"[{args.focal_gamma_min:g}, {args.focal_gamma_max:g}] | focal_alpha [{args.focal_alpha_min:g}, {args.focal_alpha_max:g}] | "
+          f"asym_gamma_pos [{args.asym_gamma_pos_min:g}, {args.asym_gamma_pos_max:g}] | asym_gamma_neg "
+          f"[{args.asym_gamma_neg_min:g}, {args.asym_gamma_neg_max:g}] | gat_heads {args.gat_heads_choices}")
+    print(f"[i] fixed: layer_type={args.fixed_layer_type or 'searched'} pool={args.fixed_pool or 'searched'} "
+          f"fourier={'searched' if args.fixed_fourier is None else args.fixed_fourier} "
+          f"pos_weight={args.fixed_pos_weight or 'searched'} gatv2_edge_attn={args.gatv2_edge_attn} "
+          f"gat_edge_attn={args.gat_edge_attn} batch_size={args.batch_size} "
+          f"normalize node/edge={args.normalize_node_features}/{args.normalize_edge_features}")
+    print(f"[i] architecture: block={args.fixed_block or 'searched'} "
+          f"relation_mp={'searched' if args.fixed_relation_mp is None else args.fixed_relation_mp} "
+          f"edge_update={args.fixed_edge_update or 'searched'} readout={args.fixed_readout or 'searched'} | "
+          f"ffn_mult={args.ffn_mult} grad_clip={args.grad_clip} relation_aggr={args.relation_aggr} "
+          f"calo_context={args.calo_context} readout_heads={args.readout_heads}")
+    if args.baseline_trial:
+        print("[i] baseline trial 0 (train script defaults): " +
+              " ".join(f"{k}={v}" for k, v in sorted(args.baseline_hparams.items())))
 
     storage = build_optuna_storage(args, out_dir)
     direction = metric_direction(args.compare_metric)
@@ -782,7 +1094,11 @@ def main() -> None:
         storage=storage,
         direction=direction,
         load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(seed=12345, n_startup_trials=max(1, int(args.n_startup_trials))),
+        # the baseline trial 0 is not counted in --n-startup-trials
+        sampler=optuna.samplers.TPESampler(
+            seed=12345,
+            n_startup_trials=max(1, int(args.n_startup_trials)) + (1 if args.baseline_trial else 0),
+        ),
     )
 
     train_script = Path(args.train_script).resolve()
@@ -798,7 +1114,13 @@ def main() -> None:
     _best_so_far: Dict[str, Any] = {"value": None, "trial": None}
 
     def objective(trial: optuna.Trial) -> float:
-        hparams = build_hparams(trial, args)
+        if is_baseline_trial(trial):
+            if trial.user_attrs.get("baseline_has_params"):
+                build_hparams(trial, args)  # registers the enqueued params (= the defaults) for TPE
+            hparams = dict(args.baseline_hparams)
+            trial.set_user_attr("hparams", hparams)
+        else:
+            hparams = build_hparams(trial, args)
         run_id = f"trial{trial.number:05d}_{now_utc_compact()}"
         save_path = build_trial_ckpt_path(ckpt_dir, args.save, run_id)
         log_path = log_dir / f"{run_id}.log"
@@ -932,7 +1254,7 @@ def main() -> None:
 
     complete_trials = [
         t for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None and not is_baseline_trial(t)
     ]
     if args.refit_only:
         _log("[mode] --refit-only set: skipping FAST Optuna optimization.")
@@ -946,6 +1268,15 @@ def main() -> None:
             f"requested={args.n_trials}  launching={n_to_run}  "
             f"objective={args.compare_metric}"
         )
+        if args.baseline_trial and not any(
+            is_baseline_trial(t) and t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.WAITING)
+            for t in study.trials
+        ):
+            params, why = baseline_enqueue_params(args.baseline_hparams, args)
+            study.enqueue_trial(params or {}, user_attrs={"baseline": True, "baseline_has_params": params is not None})
+            n_to_run += 1
+            _log("[baseline] enqueued the train-script-default trial as the next trial" +
+                 ("" if params is not None else f" (no Optuna params: {why}; TPE skips it)"))
         if n_to_run > 0:
             study.optimize(objective, n_trials=n_to_run, n_jobs=args.n_jobs, gc_after_trial=True)
 
@@ -957,8 +1288,9 @@ def main() -> None:
     if complete_trials:
         _log(f"  Best trial    : #{study.best_trial.number}")
         _log(f"  {args.compare_metric:<20} = {study.best_value}")
-        _log(f"  Best params:")
-        for k, v in sorted(study.best_trial.params.items()):
+        _log(f"  Best params:" + ("  (baseline trial: train script defaults)" if is_baseline_trial(study.best_trial) else ""))
+        best_items = study.best_trial.user_attrs["hparams"] if is_baseline_trial(study.best_trial) else study.best_trial.params
+        for k, v in sorted(best_items.items()):
             _log(f"    {k:<28} = {v}")
     else:
         _log("  No completed trials — check the latest log files for training failures.")

@@ -57,8 +57,14 @@ try:
     from dv_training_utils import (  # type: ignore
         DisplacedVertexGNN,
         H5EventDataset,
+        make_event_dataset,
         NODE_FEATURE_NAMES,
         EDGE_FEATURE_NAMES,
+        TRACK_FEATURE_NAMES,
+        SEGMENT_EDGE_FEATURE_NAMES,
+        TRACKLET_FEATURE_NAMES,
+        TRACKLET_EDGE_FEATURE_NAMES,
+        DV_NODE_FEATURE_NAMES,
         load_feature_stats_json,
         _check_split_paths_compatible,
     )
@@ -73,8 +79,14 @@ except Exception:
         spec.loader.exec_module(_mod)
         DisplacedVertexGNN = _mod.DisplacedVertexGNN
         H5EventDataset = _mod.H5EventDataset
+        make_event_dataset = _mod.make_event_dataset
         NODE_FEATURE_NAMES = _mod.NODE_FEATURE_NAMES
         EDGE_FEATURE_NAMES = _mod.EDGE_FEATURE_NAMES
+        TRACK_FEATURE_NAMES = getattr(_mod, "TRACK_FEATURE_NAMES", [])
+        SEGMENT_EDGE_FEATURE_NAMES = getattr(_mod, "SEGMENT_EDGE_FEATURE_NAMES", [])
+        TRACKLET_FEATURE_NAMES = getattr(_mod, "TRACKLET_FEATURE_NAMES", [])
+        TRACKLET_EDGE_FEATURE_NAMES = getattr(_mod, "TRACKLET_EDGE_FEATURE_NAMES", [])
+        DV_NODE_FEATURE_NAMES = getattr(_mod, "DV_NODE_FEATURE_NAMES", list(NODE_FEATURE_NAMES))
         load_feature_stats_json = _mod.load_feature_stats_json
         _check_split_paths_compatible = _mod._check_split_paths_compatible
     else:
@@ -285,12 +297,27 @@ class DisplacedVertexOnnxExportWrapper(nn.Module):
     ONNX model therefore consumes the same raw x/edge_attr tensors as the H5
     files, plus n_muon_nodes so the graph can apply the muon/calo node
     normalizers internally.
+
+    Models trained with --use-tracks take three more inputs, also raw as in the H5 files:
+        track_x          [num_tracks, 11]       TRACK_FEATURE_NAMES (asinh transform and normalization in the model)
+        track_edge_index [2, num_track_edges]   muon-track edges; track node t has index num_nodes + t
+        track_edge_attr  [num_track_edges, 5]
+
+    Models trained with --use-segment-edges / --use-tracklets take (after the track inputs, if any):
+        seg_edge_index      [2, num_seg_edges]        segment-segment edges (muon-node indices)
+        seg_edge_attr       [num_seg_edges, 7]        SEGMENT_EDGE_FEATURE_NAMES
+        tracklet_x          [num_tracklets, 11]       TRACKLET_FEATURE_NAMES
+        tracklet_edge_index [2, num_tracklet_edges]   tracklet node k has the index num_nodes + k (without the tracks)
+        tracklet_edge_attr  [num_tracklet_edges, 4]   TRACKLET_EDGE_FEATURE_NAMES
+    The positional input order is model_input_names(model).
     """
 
     def __init__(self, model: nn.Module, internal_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.internal_dtype = internal_dtype
         self.model = copy.deepcopy(model).eval()
+        self.use_tracks = bool(getattr(self.model, "use_tracks", False))
+        self.input_names = model_input_names(self.model)
         if internal_dtype == torch.float16:
             self.model = self.model.half()
 
@@ -300,21 +327,32 @@ class DisplacedVertexOnnxExportWrapper(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         n_muon_nodes: torch.Tensor,
+        *optional_inputs: torch.Tensor,
     ) -> torch.Tensor:
         x = x.to(dtype=self.internal_dtype)
         edge_index = edge_index.to(dtype=torch.long)
         edge_attr = edge_attr.to(dtype=self.internal_dtype)
         n_muon_nodes = n_muon_nodes.to(dtype=torch.long)
+        optional_names = self.input_names[len(BASE_INPUT_NAMES):]
+        if len(optional_inputs) != len(optional_names):
+            raise RuntimeError(f"This model needs the inputs {self.input_names}; got {4 + len(optional_inputs)} tensors.")
+        kwargs = {}
+        for name, value in zip(optional_names, optional_inputs):
+            kwargs[name] = value.to(dtype=torch.long) if name.endswith("edge_index") else value.to(dtype=self.internal_dtype)
         logits = self.model(
             x, edge_index, edge_attr,
             n_muon_nodes=n_muon_nodes,
             edge_dropout_p=0.0,
+            **kwargs,
         )
         return logits.to(dtype=torch.float32).view(-1)
 
 
 NORM_NODE_BUFFER_NAMES = ("mu_center", "mu_scale", "ca_center", "ca_scale")
 NORM_EDGE_BUFFER_NAMES = ("edge_center", "edge_scale")
+NORM_TRACK_BUFFER_NAMES = ("tr_center", "tr_scale", "track_edge_center", "track_edge_scale",
+                           "seg_edge_center", "seg_edge_scale", "tl_center", "tl_scale",
+                           "tracklet_edge_center", "tracklet_edge_scale")
 
 
 def _normalization_buffers_in_state(state_dict: dict[str, Any]) -> tuple[bool, bool]:
@@ -354,13 +392,27 @@ def _resolve_feature_stats_for_model(
 
 def _load_state_dict_allowing_initialized_norm_buffers(model: nn.Module, state_dict: dict[str, Any]) -> None:
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = set(NORM_NODE_BUFFER_NAMES + NORM_EDGE_BUFFER_NAMES)
+    allowed_missing = set(NORM_NODE_BUFFER_NAMES + NORM_EDGE_BUFFER_NAMES + NORM_TRACK_BUFFER_NAMES)
     bad_missing = [k for k in missing if k not in allowed_missing]
     if bad_missing or unexpected:
         raise RuntimeError(
             "Checkpoint state_dict is incompatible with DisplacedVertexGNN: "
             f"missing={bad_missing}, unexpected={list(unexpected)}"
         )
+
+
+def checkpoint_architecture_options(ckpt: dict) -> dict:
+    """DisplacedVertexGNN architecture keyword arguments of a checkpoint (the legacy model for older checkpoints)."""
+    return {
+        "block": str(_ckpt_get(ckpt, "block", "legacy")),
+        "ffn_mult": int(_ckpt_get(ckpt, "ffn_mult", 2)),
+        "relation_mp": bool(_ckpt_get(ckpt, "relation_mp", False)),
+        "relation_aggr": str(_ckpt_get(ckpt, "relation_aggr", "attn_max")),
+        "calo_context": str(_ckpt_get(ckpt, "calo_context", "two_way")),
+        "edge_update": str(_ckpt_get(ckpt, "edge_update", "none")),
+        "readout": str(_ckpt_get(ckpt, "readout", "global")),
+        "readout_heads": int(_ckpt_get(ckpt, "readout_heads", 4)),
+    }
 
 
 def build_displaced_vertex_model_from_checkpoint(
@@ -389,6 +441,13 @@ def build_displaced_vertex_model_from_checkpoint(
     fourier_base = float(_ckpt_get(ckpt, "fourier_base", 3.0))
     fourier_min_exp = int(_ckpt_get(ckpt, "fourier_min_exp", -6))
     fourier_max_exp = int(_ckpt_get(ckpt, "fourier_max_exp", 6))
+    track_xdim = int(_ckpt_get(ckpt, "track_xdim", 0) or 0)
+    node_type_embedding = bool(_ckpt_get(ckpt, "node_type_embedding", False))
+    track_asinh_scales = _ckpt_get(ckpt, "track_asinh_scales", None)
+    seg_edim = int(_ckpt_get(ckpt, "seg_edim", 0) or 0)
+    tracklet_xdim = int(_ckpt_get(ckpt, "tracklet_xdim", 0) or 0)
+    tracklet_edim = int(_ckpt_get(ckpt, "tracklet_edim", 0) or 0)
+    arch = checkpoint_architecture_options(ckpt)
 
     state_dict = _strip_module_prefix(ckpt["model_state"])
     state_has_node_buffers, state_has_edge_buffers = _normalization_buffers_in_state(state_dict)
@@ -426,6 +485,13 @@ def build_displaced_vertex_model_from_checkpoint(
         normalize_edge_features=norm_edge,
         feature_stats=feature_stats,
         feature_norm_clip=norm_clip,
+        track_xdim=track_xdim,
+        node_type_embedding=node_type_embedding,
+        track_asinh_scales=track_asinh_scales,
+        seg_edim=seg_edim,
+        tracklet_xdim=tracklet_xdim,
+        tracklet_edim=tracklet_edim,
+        **arch,
     )
     _load_state_dict_allowing_initialized_norm_buffers(model, state_dict)
     model.eval()
@@ -434,10 +500,44 @@ def build_displaced_vertex_model_from_checkpoint(
     return wrapper, ckpt
 
 
-def infer_input_feature_metadata(xdim: int, edim: int) -> dict:
+BASE_INPUT_NAMES = ["x", "edge_index", "edge_attr", "n_muon_nodes"]
+TRACK_INPUT_NAMES = ["track_x", "track_edge_index", "track_edge_attr"]
+SEGMENT_EDGE_INPUT_NAMES = ["seg_edge_index", "seg_edge_attr"]
+TRACKLET_INPUT_NAMES = ["tracklet_x", "tracklet_edge_index", "tracklet_edge_attr"]
+
+
+def model_input_names(model: nn.Module) -> list[str]:
+    """ONNX input names (and positional order of DisplacedVertexOnnxExportWrapper) of a DisplacedVertexGNN."""
+    names = list(BASE_INPUT_NAMES)
+    if getattr(model, "use_tracks", False):
+        names += TRACK_INPUT_NAMES
+    if getattr(model, "use_segment_edges", False):
+        names += SEGMENT_EDGE_INPUT_NAMES
+    if getattr(model, "use_tracklets", False):
+        names += TRACKLET_INPUT_NAMES
+    return names
+
+
+def segment_block_metadata(ckpt: dict) -> dict:
+    """ONNX metadata of the segment-block conventions, checked by DVInferenceToolBase::initialize: the muon-node
+    column 5 and the converter settings of the segment-segment edges / tracklets of the training graphs."""
+    muon_names = list(_ckpt_get(ckpt, "muon_node_feature_names", None) or DV_NODE_FEATURE_NAMES)
+    conv = _ckpt_get(ckpt, "converter_config", None) or {}
+    meta = {
+        "muon_node_feature_names_json": json.dumps(muon_names),
+        "muon_slot5_feature": str(muon_names[5]),
+    }
+    for key in ("segment_edge_max_dr", "tracklet_max_dr", "tracklet_max_chord_angle", "tracklet_min_layers"):
+        if key in conv and conv[key] is not None:
+            meta[f"converter_{key}"] = str(conv[key])
+    return meta
+
+
+def infer_input_feature_metadata(xdim: int, edim: int, track_xdim: int = 0, seg_edim: int = 0,
+                                 tracklet_xdim: int = 0, tracklet_edim: int = 0) -> dict:
     node_names = list(NODE_FEATURE_NAMES) if len(NODE_FEATURE_NAMES) == int(xdim) else [f"x_{i}" for i in range(int(xdim))]
     edge_names = list(EDGE_FEATURE_NAMES) if len(EDGE_FEATURE_NAMES) == int(edim) else [f"edge_attr_{i}" for i in range(int(edim))]
-    return {
+    meta = {
         "input_names": ["x", "edge_index", "edge_attr", "n_muon_nodes"],
         "input_metadata_names": ["n_muon_nodes"],
         "node_feature_names": node_names,
@@ -447,7 +547,38 @@ def infer_input_feature_metadata(xdim: int, edim: int) -> dict:
         "input_node_feature_dim": int(xdim),
         "input_edge_feature_dim": int(edim),
         "edge_index_feature_names": ["src_node_index", "dst_node_index"],
+        "requires_track_inputs": bool(track_xdim > 0),
     }
+    if track_xdim > 0:
+        track_names = (list(TRACK_FEATURE_NAMES) if len(TRACK_FEATURE_NAMES) == int(track_xdim)
+                       else [f"track_x_{i}" for i in range(int(track_xdim))])
+        meta.update({
+            "input_names": meta["input_names"] + TRACK_INPUT_NAMES,
+            "track_feature_names": track_names,
+            "track_feature_names_json": json.dumps(track_names),
+            "input_track_feature_dim": int(track_xdim),
+            "track_edge_feature_names_json": json.dumps(edge_names),
+            "track_node_index_convention": "track node t has the node index num_nodes + t (num_nodes = x.shape[0])",
+        })
+    meta["requires_segment_edge_inputs"] = bool(seg_edim > 0)
+    if seg_edim > 0:
+        meta.update({
+            "input_names": meta["input_names"] + SEGMENT_EDGE_INPUT_NAMES,
+            "segment_edge_feature_names_json": json.dumps(list(SEGMENT_EDGE_FEATURE_NAMES)),
+            "input_segment_edge_feature_dim": int(seg_edim),
+        })
+    meta["requires_tracklet_inputs"] = bool(tracklet_xdim > 0)
+    if tracklet_xdim > 0:
+        meta.update({
+            "input_names": meta["input_names"] + TRACKLET_INPUT_NAMES,
+            "tracklet_feature_names_json": json.dumps(list(TRACKLET_FEATURE_NAMES)),
+            "tracklet_edge_feature_names_json": json.dumps(list(TRACKLET_EDGE_FEATURE_NAMES)),
+            "input_tracklet_feature_dim": int(tracklet_xdim),
+            "input_tracklet_edge_feature_dim": int(tracklet_edim),
+            "tracklet_node_index_convention": "tracklet node k has the node index num_nodes + k (num_nodes = x.shape[0], "
+                                              "independent of the track inputs)",
+        })
+    return meta
 
 
 def add_onnx_metadata(onnx_path: Path, metadata: dict) -> dict:
@@ -470,6 +601,30 @@ def add_onnx_metadata(onnx_path: Path, metadata: dict) -> dict:
         return {"metadata_written": False, "metadata_reason": repr(exc)}
 
 
+_SCATTER_REDUCE_ONNX = {"amax": "max", "amin": "min", "sum": "add", "prod": "mul"}
+
+
+def _scatter_reduce_symbolic(g, self, dim, index, src, reduce, include_self):
+    """aten::scatter_reduce -> one ScatterElements with reduction, without the rank-0 If wrapper of the default
+    symbolic: the If branches declare a 1-D output, which makes onnxruntime >= 1.23 log a VerifyOutputSizes warning
+    per scatter and event (OnnxRuntimeSvc logs warnings by default). The graphs here never scatter 0-d tensors."""
+    from torch.onnx import symbolic_helper
+
+    dim_i = symbolic_helper._get_const(dim, "i", "dim")
+    reduce_s = symbolic_helper._get_const(reduce, "s", "reduce")
+    include_self_b = symbolic_helper._get_const(include_self, "b", "include_self")
+    if not include_self_b or reduce_s not in _SCATTER_REDUCE_ONNX:
+        raise RuntimeError(f"scatter_reduce(reduce={reduce_s!r}, include_self={include_self_b}) has no ONNX export here")
+    return g.op("ScatterElements", self, index, src, axis_i=dim_i, reduction_s=_SCATTER_REDUCE_ONNX[reduce_s])
+
+
+def _uses_new_architecture(model: nn.Module) -> bool:
+    """True for DisplacedVertexGNN models with a non-legacy architecture option (block / relation_mp / readout)."""
+    inner = getattr(model, "model", model)
+    return (str(getattr(inner, "block", "legacy")) != "legacy" or bool(getattr(inner, "relation_mp", False))
+            or str(getattr(inner, "readout", "global")) != "global")
+
+
 def export_model_to_onnx(
     model: nn.Module,
     out_path: Path,
@@ -480,34 +635,118 @@ def export_model_to_onnx(
     dummy_n_muon_nodes: torch.Tensor,
     onnx_opset: int,
     metadata: dict | None = None,
+    dummy_track_x: torch.Tensor | None = None,
+    dummy_track_edge_index: torch.Tensor | None = None,
+    dummy_track_edge_attr: torch.Tensor | None = None,
+    dummy_seg_edge_index: torch.Tensor | None = None,
+    dummy_seg_edge_attr: torch.Tensor | None = None,
+    dummy_tracklet_x: torch.Tensor | None = None,
+    dummy_tracklet_edge_index: torch.Tensor | None = None,
+    dummy_tracklet_edge_attr: torch.Tensor | None = None,
 ) -> dict:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if onnx is None:
         return {"exported": False, "reason": "onnx package not installed", "onnx_path": str(out_path)}
 
+    inputs = [dummy_x.float(), dummy_edge_index.long(), dummy_edge_attr.float(), dummy_n_muon_nodes.long()]
+    input_names = ["x", "edge_index", "edge_attr", "n_muon_nodes"]
+    dynamic_axes = {
+        "x": {0: "num_nodes"},
+        "edge_index": {1: "num_edges"},
+        "edge_attr": {0: "num_edges"},
+        "logits": {0: "num_graphs"},
+    }
+    if dummy_track_x is not None:
+        inputs += [dummy_track_x.float(), dummy_track_edge_index.long(), dummy_track_edge_attr.float()]
+        input_names += TRACK_INPUT_NAMES
+        dynamic_axes.update({
+            "track_x": {0: "num_tracks"},
+            "track_edge_index": {1: "num_track_edges"},
+            "track_edge_attr": {0: "num_track_edges"},
+        })
+    if dummy_seg_edge_index is not None:
+        inputs += [dummy_seg_edge_index.long(), dummy_seg_edge_attr.float()]
+        input_names += SEGMENT_EDGE_INPUT_NAMES
+        dynamic_axes.update({"seg_edge_index": {1: "num_seg_edges"}, "seg_edge_attr": {0: "num_seg_edges"}})
+    if dummy_tracklet_x is not None:
+        inputs += [dummy_tracklet_x.float(), dummy_tracklet_edge_index.long(), dummy_tracklet_edge_attr.float()]
+        input_names += TRACKLET_INPUT_NAMES
+        dynamic_axes.update({
+            "tracklet_x": {0: "num_tracklets"},
+            "tracklet_edge_index": {1: "num_tracklet_edges"},
+            "tracklet_edge_attr": {0: "num_tracklet_edges"},
+        })
+    expected = getattr(model, "input_names", None)
+    if expected is not None and list(expected) != input_names:
+        return {"exported": False, "reason": f"dummy inputs {input_names} do not match the model inputs {expected}",
+                "onnx_path": str(out_path)}
+
+    # Models with the new architecture options: scatter_reduce as a plain ScatterElements (opset >= 18); the legacy
+    # models keep the default export
+    plain_scatter = _uses_new_architecture(model) and int(onnx_opset) >= 18
     try:
-        torch.onnx.export(
-            model,
-            (dummy_x.float(), dummy_edge_index.long(), dummy_edge_attr.float(), dummy_n_muon_nodes.long()),
-            str(out_path),
-            input_names=["x", "edge_index", "edge_attr", "n_muon_nodes"],
-            output_names=["logits"],
-            dynamic_axes={
-                "x": {0: "num_nodes"},
-                "edge_index": {1: "num_edges"},
-                "edge_attr": {0: "num_edges"},
-                "logits": {0: "num_graphs"},
-            },
-            opset_version=int(onnx_opset),
-            export_params=True,
-            do_constant_folding=True,
-        )
+        if plain_scatter:
+            torch.onnx.register_custom_op_symbolic("aten::scatter_reduce", _scatter_reduce_symbolic, int(onnx_opset))
+        try:
+            torch.onnx.export(
+                model,
+                tuple(inputs),
+                str(out_path),
+                input_names=input_names,
+                output_names=["logits"],
+                dynamic_axes=dynamic_axes,
+                opset_version=int(onnx_opset),
+                export_params=True,
+                do_constant_folding=True,
+            )
+        finally:
+            if plain_scatter:
+                torch.onnx.unregister_custom_op_symbolic("aten::scatter_reduce", int(onnx_opset))
         out = {"exported": True, "onnx_path": str(out_path), "reason": ""}
         if metadata:
             out.update(add_onnx_metadata(out_path, metadata))
         return out
     except Exception as exc:
         return {"exported": False, "reason": repr(exc), "onnx_path": str(out_path)}
+
+
+def make_dummy_track_inputs(*, n_nodes: int, n_muon: int, track_xdim: int, edim: int, n_tracks: int = 8) -> dict:
+    """Valid dummy track block for the ONNX export: muon <-> track edges, track t = n_nodes + t."""
+    n_pairs = 2 * n_tracks
+    mu = torch.randint(0, max(1, n_muon), (n_pairs,), dtype=torch.long)
+    trk = n_nodes + torch.randint(0, n_tracks, (n_pairs,), dtype=torch.long)
+    return {
+        "dummy_track_x": torch.randn(n_tracks, track_xdim, dtype=torch.float32),
+        "dummy_track_edge_index": torch.stack([torch.cat([mu, trk]), torch.cat([trk, mu])], dim=0),
+        "dummy_track_edge_attr": torch.randn(2 * n_pairs, edim, dtype=torch.float32),
+    }
+
+
+def make_dummy_segment_edge_inputs(*, n_muon: int, seg_edim: int, n_pairs: int = 16) -> dict:
+    """Valid dummy segment-segment edges for the ONNX export (muon-node indices, both directions)."""
+    a = torch.randint(0, max(1, n_muon), (n_pairs,), dtype=torch.long)
+    b = torch.randint(0, max(1, n_muon), (n_pairs,), dtype=torch.long)
+    return {
+        "dummy_seg_edge_index": torch.stack([torch.cat([a, b]), torch.cat([b, a])], dim=0),
+        "dummy_seg_edge_attr": torch.randn(2 * n_pairs, seg_edim, dtype=torch.float32),
+    }
+
+
+def make_dummy_tracklet_inputs(*, n_nodes: int, n_muon: int, tracklet_xdim: int, tracklet_edim: int,
+                               n_tracklets: int = 4) -> dict:
+    """Valid dummy tracklet block for the ONNX export: segment <-> tracklet and tracklet <-> tracklet edges,
+    tracklet k = n_nodes + k."""
+    seg = torch.randint(0, max(1, n_muon), (3 * n_tracklets,), dtype=torch.long)
+    tl = n_nodes + torch.arange(n_tracklets, dtype=torch.long).repeat(3)
+    pair_a = n_nodes + torch.arange(n_tracklets, dtype=torch.long)
+    pair_b = n_nodes + torch.roll(torch.arange(n_tracklets, dtype=torch.long), 1)
+    src = torch.cat([seg, tl, pair_a])
+    dst = torch.cat([tl, seg, pair_b])
+    return {
+        "dummy_tracklet_x": torch.randn(n_tracklets, tracklet_xdim, dtype=torch.float32),
+        "dummy_tracklet_edge_index": torch.stack([src, dst], dim=0),
+        "dummy_tracklet_edge_attr": torch.randn(src.numel(), tracklet_edim, dtype=torch.float32),
+    }
 
 
 def inspect_onnx_artifact(onnx_path: Path) -> dict:
@@ -1185,12 +1424,30 @@ def make_ort_feed(sess, item: dict) -> dict[str, np.ndarray]:
         "edge_attr": np.ascontiguousarray(item["edge_attr"].numpy(), dtype=np.float32),
         "n_muon_nodes": np.ascontiguousarray(item["n_muon_nodes"].numpy().reshape(1), dtype=np.int64),
     }
+    if "track_x" in item:
+        arrays["track_x"] = np.ascontiguousarray(item["track_x"].numpy(), dtype=np.float32)
+        arrays["track_edge_index"] = np.ascontiguousarray(item["track_edge_index"].numpy(), dtype=np.int64)
+        arrays["track_edge_attr"] = np.ascontiguousarray(item["track_edge_attr"].numpy(), dtype=np.float32)
+    for name in SEGMENT_EDGE_INPUT_NAMES + TRACKLET_INPUT_NAMES:
+        if name in item:
+            dtype = np.int64 if name.endswith("edge_index") else np.float32
+            arrays[name] = np.ascontiguousarray(item[name].numpy(), dtype=dtype)
     feed = {}
     for inp in sess.get_inputs():
         name = inp.name
         lower = name.lower()
         if name in arrays:
             feed[name] = arrays[name]
+        elif name in SEGMENT_EDGE_INPUT_NAMES or name in TRACKLET_INPUT_NAMES:
+            raise KeyError(
+                f"ONNX input {name!r} needs the segment blocks: evaluate with graphs converted with "
+                "--segment-edges / --tracklets (the dataset must be created with use_segment_edges / use_tracklets)."
+            )
+        elif lower.startswith("track"):
+            raise KeyError(
+                f"ONNX input {name!r} needs the track block: evaluate with the track-converted H5 files "
+                "(the dataset must be created with use_tracks=True)."
+            )
         elif "n_muon" in lower or "nmuon" in lower:
             feed[name] = arrays["n_muon_nodes"]
         elif "edge_index" in lower or lower.endswith("edgeindex"):
@@ -1227,21 +1484,28 @@ def evaluate_onnx_model_on_files(
     # Reuse the pre-indexed event table stored in the split file. Scanning all
     # HDF5 event groups here is extremely slow on EOS and duplicates work that
     # was already completed when the split was created.
+    use_tracks = int(_ckpt_get(ckpt, "track_xdim", 0) or 0) > 0
+    use_segment_edges = int(_ckpt_get(ckpt, "seg_edim", 0) or 0) > 0
+    use_tracklets = int(_ckpt_get(ckpt, "tracklet_xdim", 0) or 0) > 0
     split = None
     if args.split_file is not None:
         split = np.load(Path(args.split_file).expanduser().resolve(), allow_pickle=True)
     if split is not None and "event_refs" in split.files and "labels" in split.files:
-        dataset = H5EventDataset(
+        dataset = make_event_dataset(
             [str(p) for p in input_paths],
             event_refs=split["event_refs"],
             labels=split["labels"],
             dataset_names=split["dataset_names"] if "dataset_names" in split.files else None,
             root_files=split["root_files"] if "root_files" in split.files else None,
             max_open_h5_files=16,
+            use_tracks=use_tracks,
+            use_segment_edges=use_segment_edges,
+            use_tracklets=use_tracklets,
         )
         index_source = "split_file_event_refs"
     else:
-        dataset = H5EventDataset([str(p) for p in input_paths], max_open_h5_files=16)
+        dataset = make_event_dataset([str(p) for p in input_paths], max_open_h5_files=16, use_tracks=use_tracks,
+                                 use_segment_edges=use_segment_edges, use_tracklets=use_tracklets)
         index_source = "h5_scan"
     eval_indices, split_meta = build_eval_indices(args, input_paths, dataset)
 
@@ -1748,7 +2012,12 @@ def main():
 
         xdim = int(_ckpt_get(item.ckpt, "xdim", 7))
         edim = int(_ckpt_get(item.ckpt, "edim", 5))
-        feature_metadata = infer_input_feature_metadata(xdim, edim)
+        track_xdim = int(_ckpt_get(item.ckpt, "track_xdim", 0) or 0)
+        seg_edim = int(_ckpt_get(item.ckpt, "seg_edim", 0) or 0)
+        tracklet_xdim = int(_ckpt_get(item.ckpt, "tracklet_xdim", 0) or 0)
+        tracklet_edim = int(_ckpt_get(item.ckpt, "tracklet_edim", 0) or 0)
+        feature_metadata = infer_input_feature_metadata(xdim, edim, track_xdim, seg_edim, tracklet_xdim, tracklet_edim)
+        feature_metadata.update(segment_block_metadata(item.ckpt))
         norm_node, norm_edge, stats_json, norm_kind, norm_clip = resolve_normalization_for_checkpoint(item.ckpt, args)
         metadata_for_onnx = {
             **feature_metadata,
@@ -1765,6 +2034,9 @@ def main():
             "feature_norm_clip": float(norm_clip),
             "feature_norm_in_model": bool(norm_node or norm_edge),
             "requires_n_muon_nodes_input": True,
+            "node_type_embedding": bool(_ckpt_get(item.ckpt, "node_type_embedding", False)),
+            "track_asinh_scales": _ckpt_get(item.ckpt, "track_asinh_scales", None) or [],
+            **{f"arch_{k}": v for k, v in checkpoint_architecture_options(item.ckpt).items()},
             "single_output_mode": str(args.single_output_mode),
             "score_transform": "sigmoid(logit); use --single-output-mode prob only for probability-output ONNX models",
         }
@@ -1786,6 +2058,19 @@ def main():
             dummy_edge_index = torch.stack([dummy_src, dummy_dst], dim=0)
             dummy_edge_attr = torch.randn(int(args.onnx_dummy_edges), edim, dtype=torch.float32)
             dummy_n_muon_nodes = torch.tensor([max(1, int(args.onnx_dummy_nodes) // 2)], dtype=torch.long)
+            dummy_tracks = {}
+            if track_xdim > 0:
+                dummy_tracks = make_dummy_track_inputs(
+                    n_nodes=int(args.onnx_dummy_nodes), n_muon=int(dummy_n_muon_nodes[0]),
+                    track_xdim=track_xdim, edim=edim,
+                )
+            if seg_edim > 0:
+                dummy_tracks.update(make_dummy_segment_edge_inputs(n_muon=int(dummy_n_muon_nodes[0]), seg_edim=seg_edim))
+            if tracklet_xdim > 0:
+                dummy_tracks.update(make_dummy_tracklet_inputs(
+                    n_nodes=int(args.onnx_dummy_nodes), n_muon=int(dummy_n_muon_nodes[0]),
+                    tracklet_xdim=tracklet_xdim, tracklet_edim=tracklet_edim,
+                ))
             export_core = export_model_to_onnx(
                 item.model,
                 onnx_path,
@@ -1795,6 +2080,7 @@ def main():
                 dummy_n_muon_nodes=dummy_n_muon_nodes,
                 onnx_opset=args.onnx_opset,
                 metadata=metadata_for_onnx,
+                **dummy_tracks,
             )
             export_info.update(export_core)
         else:
