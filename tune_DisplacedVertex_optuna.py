@@ -3,9 +3,34 @@
 Optuna tuner for DisplacedVertex graph-level binary classifier training.
 
 Default objective:
-  maximize val_tpr_at_target_fpr, with --target-fpr 0.01 by default.
+  maximize val_tpr_at_target_fpr, with --target-fpr 0.001 by default.
 That means trials are ranked by the highest validation TPR achievable while the
-validation FPR is constrained to be <= 1%.
+validation FPR is constrained to be <= 0.1% (before 2026-11-24: 1%).
+
+Trial score (--objective-window W): the best mean of the objective over W consecutive epochs (default 1 = the
+single best epoch, as before). The single best epoch of a noisy metric is biased upwards by the epoch-to-epoch noise;
+W=3 compares the trials on a plateau instead.
+
+Protocol flags shared by all phases (stored in the study at its first run; a later run with other values stops):
+  --global-batch-size N  graphs per optimizer step summed over the GPUs of a run: every phase (fast, confirm, refit)
+                         gets N / its GPU count per GPU, so the learning rate found in the fast trials sees the same
+                         batch in the refit (default: --batch-size per GPU in every phase, as before).
+  --objective-window W, --compare-metric, --target-fpr, --fast-epochs, --fast-max-train-events.
+
+Batch per architecture (--batch-size auto, as in tune_SegmentClassifier_optuna.py): every searched fast trial lets
+the trainer probe --auto-batch-candidates per GPU for its own model (the fastest that fits --auto-batch-mem-frac of
+the GPU memory), --lr is defined at the global batch --lr-ref-batch and scaled to the trial's global batch
+(--lr-batch-scaling, default sqrt; the EMA decay too). The trial's confirm runs and refit keep its global batch,
+split over their GPUs; trial 0 runs at --lr-ref-batch. Excludes --global-batch-size.
+
+Pruning (--prune): every epoch line of a fast trial reports its running score to Optuna; after
+--prune-warmup-epochs a trial whose score is outside the best --prune-percentile % of the completed trials at the
+same epoch is stopped (process tree terminated) and marked PRUNED. Trial 0 is never pruned; pruning starts after
+--prune-startup-trials completed trials.
+
+Leaderboard (always): <out-dir>/leaderboard.md and leaderboard.csv are rewritten after every trial, confirm run and
+refit: best configuration, refits, confirmed ranking, per-architecture summary, fast trials, parameter importances.
+--report-only rewrites them without running anything (also while a study runs).
 
 With the patched trainer, --normalize-node-features / --normalize-edge-features
 make the trainer store normalization statistics as model buffers and apply them
@@ -29,6 +54,14 @@ search a knob again; the old wide ranges are in each flag's help.
 Trial 0 is a baseline: train_DisplacedVertex.py's own defaults (the best model). It is
 added on top of --n-trials, and --n-startup-trials random trials follow it.
 
+Optional confirm phase (--confirm-top-k K --confirm-seeds N, between the fast phase and the refit): the top K fast
+trials are re-run with N new seeds each and ranked by the mean over the seeds; the refit takes its --refit-top-k
+from this ranking. With the fast protocol (default) the fast trial counts as one seed. With a higher fidelity
+(--confirm-max-train-events / --confirm-epochs / --confirm-gpus-per-trial different from the fast trials) the
+ranking uses only the N confirm runs (seeds: the trainer seed + 100*s, s = 0..N-1). Runs: <out-dir>/confirm.jsonl
+(a restarted tuner reuses them), ranking: <out-dir>/confirm_summary.json (rewritten after every run). Also with
+--refit-only (confirms the finished study).
+
 Architecture options of the trainer (GAT trials; the defaults keep the legacy model, the search space above was
 narrowed on it): --fixed-block legacy|prenorm, --fixed-relation-mp false|true, --fixed-edge-update
 none|seg|seg_tracklet (relation-mp trials), --fixed-readout global|typed|typed_attn ('any' searches one of them),
@@ -36,31 +69,34 @@ plus the fixed knobs --ffn-mult, --grad-clip, --relation-aggr, --calo-context, -
 the options fix one at a time; deeper prenorm stacks: --layers-max 8. The baseline trial keeps the trainer defaults
 (it lies outside a study with other fixed options and then runs without Optuna params).
 
-Example:
+Example (the full command list: README.md, "Displaced-vertex classifier"):
 TUNE_FLAGS=(
   --train-script ./train_DisplacedVertex.py
-  --data-glob "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/*.h5"
-  --split-file "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/split_displaced_vertex_seed12345.npz"
-  --feature-stats-json "/shared/wp2p5/data/data_displacedVtx_mu200_graphs/normalization_stats_raw.json"
+  --data-glob "/shared/wp2p5/data/displacedVtx_classifier_mu200/*.packed"
+  --split-file "/shared/wp2p5/data/displacedVtx_classifier_mu200/split_displaced_vertex_seed12345.npz"
+  --feature-stats-json "/shared/wp2p5/data/displacedVtx_classifier_mu200/normalization_stats_raw.json"
   --out-dir "/shared/wp2p5/models/tuning_dv_classifier_gatv2"
   --study-name dv_classifier_gatv2
-  --compare-metric val_tpr_at_target_fpr --target-fpr 0.01
+  --compare-metric val_tpr_at_target_fpr --target-fpr 0.001
   --num-workers 4 --pin-memory --wandb-mode disabled
+  --fixed-layer-type gat_residual --gatv2-edge-attn
+  --fixed-block any --fixed-relation-mp any --fixed-edge-update any --fixed-readout any --layers-max 8
+  --fast-epochs 40 --fast-max-train-events 100000 --fast-gpus-per-trial 1 --n-jobs 8
+  --batch-size auto --objective-window 3
 )
 python -u tune_DisplacedVertex_optuna.py "${TUNE_FLAGS[@]}" \
-  --n-trials 120 --n-startup-trials 60 \
-  --fast-epochs 60 --fast-max-train-events 100000 \
-  --fast-gpus-per-trial 2 --n-jobs 4 \
+  --n-trials 160 --n-startup-trials 50 --prune \
   --refit-top-k 0 2>&1 | tee -a log_tune_dv_classifier_gatv2.txt
 
-# later: refit the best 5 on the full train split (same study, same flags)
+# later: confirm the best 10 on 4x the training events, refit the best 5 on the full train split (same flags)
 python -u tune_DisplacedVertex_optuna.py "${TUNE_FLAGS[@]}" \
-  --refit-only --refit-top-k 5 --refit-epochs 200 \
-  --refit-gpus-per-trial 8 2>&1 | tee -a log_tune_dv_classifier_gatv2_refit.txt
+  --refit-only --confirm-top-k 10 --confirm-seeds 2 --confirm-max-train-events 400000 \
+  --refit-top-k 5 --refit-epochs 200 --refit-gpus-per-trial 8 2>&1 | tee -a log_tune_dv_classifier_gatv2_refit.txt
 """
 
 import argparse
 import ast
+import csv
 from datetime import datetime
 import glob
 import json
@@ -69,6 +105,7 @@ import os
 import random
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import socket
@@ -76,7 +113,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import optuna
 import optuna.logging
@@ -187,37 +224,90 @@ def is_better(metric: str, new: float, best: Optional[float]) -> bool:
     return new > best
 
 
-def parse_best_metrics_from_log(log_path: Path, compare_metric: str) -> Dict[str, Any]:
+def epoch_row_from_line(line: str) -> Optional[Dict[str, Any]]:
+    """Metrics of a trainer '[epoch NNN] ...' line, or None."""
+    m = EPOCH_LINE_RE.search(line.strip())
+    if not m:
+        return None
+    row: Dict[str, Any] = {"epoch": int(m.group("epoch"))}
+    for key in METRICS:
+        row[key] = safe_float(m.groupdict().get(key))
+    return row
+
+
+def windowed_best(values: List[Optional[float]], window: int, maximize: bool) -> Tuple[Optional[float], Optional[int]]:
+    """Best mean of `window` consecutive per-epoch values and the index of the window's last epoch (the first one on
+    ties). Fewer epochs than the window: the mean of all of them. Windows with a missing value are skipped. window=1
+    is the single best epoch."""
+    w = max(1, int(window))
+    if not values:
+        return None, None
+    if len(values) < w:
+        if any(v is None for v in values):
+            return None, None
+        return sum(values) / len(values), len(values) - 1
+    best: Optional[float] = None
+    best_end: Optional[int] = None
+    for end in range(w - 1, len(values)):
+        win = values[end - w + 1:end + 1]
+        if any(v is None for v in win):
+            continue
+        mean = sum(win) / w
+        if best is None or (mean > best if maximize else mean < best):
+            best, best_end = mean, end
+    return best, best_end
+
+
+# trainer lines that describe the run (stored with each trial: data format, sampler, batch, model size)
+RUN_INFO_RES = {
+    "trainable_params": (re.compile(r"trainable_params=(\d+)"), int),
+    "indexing_seconds": (re.compile(r"^\[time\] dataset indexing: ([0-9.]+)s"), float),
+    "data_format": (re.compile(r"^\[i\] data=(packed parts|H5) "), str),
+    "sampler": (re.compile(r"^\[i\] data=(?:packed parts|H5) sampler: (.*)$"), str),
+    "batch_size_per_rank": (re.compile(r"batch_size_per_rank=(\d+)"), int),
+    "global_batch_size": (re.compile(r"effective_global_batch_size=(\d+)"), int),
+}
+
+
+def parse_best_metrics_from_log(log_path: Path, compare_metric: str, window: int = 1) -> Dict[str, Any]:
+    """objective_value = windowed_best(...) of compare_metric over the epoch lines (window 1: the single best epoch);
+    best_row = the single best epoch, window_row = the metrics averaged over the best window (+ window_epochs)."""
+    empty = {"objective_value": None, "best_row": {}, "last_row": {}, "n_epochs_seen": 0, "best_epoch_value": None,
+             "window_row": {}, "window_epochs": None, "objective_window": int(window), "run_info": {}}
     if not log_path.exists():
-        return {"objective_value": None, "best_row": {}, "last_row": {}, "n_epochs_seen": 0}
+        return empty
+    maximize = metric_direction(compare_metric) == "maximize"
 
     last_error: Optional[OSError] = None
     for attempt in range(6):
-        best_value = None
-        best_row: Dict[str, Any] = {}
-        last_row: Dict[str, Any] = {}
-        n_epochs = 0
+        rows: List[Dict[str, Any]] = []
+        info: Dict[str, Any] = {}
         try:
             with log_path.open("r", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    m = EPOCH_LINE_RE.search(line.strip())
-                    if not m:
+                    row = epoch_row_from_line(line)
+                    if row is not None:
+                        rows.append(row)
                         continue
-                    n_epochs += 1
-                    row: Dict[str, Any] = {"epoch": int(m.group("epoch"))}
-                    for key in METRICS:
-                        row[key] = safe_float(m.groupdict().get(key))
-                    last_row = row
-                    value = row.get(compare_metric)
-                    if value is not None and is_better(compare_metric, value, best_value):
-                        best_value = value
-                        best_row = row
-            return {
-                "objective_value": best_value,
-                "best_row": best_row,
-                "last_row": last_row,
-                "n_epochs_seen": n_epochs,
-            }
+                    for key, (rx, cast) in RUN_INFO_RES.items():
+                        if key not in info:
+                            m = rx.search(line.rstrip("\n"))
+                            if m:
+                                info[key] = cast(m.group(1))
+            out = dict(empty, run_info=info, n_epochs_seen=len(rows), last_row=rows[-1] if rows else {})
+            values = [r.get(compare_metric) for r in rows]
+            single, i_single = windowed_best(values, 1, maximize)
+            if single is not None:
+                out["best_epoch_value"] = single
+                out["best_row"] = rows[i_single]
+            value, end = windowed_best(values, window, maximize)
+            if value is not None:
+                win_rows = rows[max(0, end - max(1, int(window)) + 1):end + 1]
+                out["objective_value"] = value
+                out["window_epochs"] = [win_rows[0]["epoch"], win_rows[-1]["epoch"]]
+                out["window_row"] = {k: (sum(r[k] for r in win_rows) / len(win_rows)
+                                         if all(r.get(k) is not None for r in win_rows) else None) for k in METRICS}
+            return out
         except OSError as exc:
             last_error = exc
             if attempt == 5:
@@ -294,6 +384,117 @@ def torchrun_nproc(gpus_per_trial: int, devices: List[str]) -> int:
         return 0
     n = max(1, min(int(gpus_per_trial), n_visible_for_trial))
     return n if n > 1 else 0
+
+
+def phase_world(gpus_per_trial: int, n_devices: int) -> int:
+    """Number of training processes of a run with gpus_per_trial GPUs (what the GPUAllocator hands out)."""
+    if n_devices <= 0:
+        return 1
+    return max(1, min(int(gpus_per_trial), int(n_devices)))
+
+
+def tuner_batch_arg(value):
+    """--batch-size of the tuner: graphs per GPU, or 'auto' (the trainer probes every trial's model on its GPU)."""
+    if str(value).lower() == "auto":
+        return "auto"
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"must be an integer or 'auto', got {value!r}")
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return v
+
+
+def auto_batch(args: argparse.Namespace) -> bool:
+    return getattr(args, "batch_size", None) == "auto"
+
+
+def per_rank_batch_size(args: argparse.Namespace, world: int, global_batch: Optional[int] = None):
+    """Trainer --batch-size of a run with `world` processes:
+    - global_batch given (a trial's own batch: --batch-size auto, its confirm runs and refit; trial 0): global / world;
+    - --batch-size auto (searched fast trials): 'auto';
+    - --global-batch-size: global / world;
+    - else the tuner's --batch-size (per GPU in every phase, the former behaviour)."""
+    world = max(1, int(world))
+    if global_batch is not None:
+        if int(global_batch) % world:
+            raise SystemExit(f"global batch {global_batch} is not divisible by the {world} GPUs of a run")
+        return int(global_batch) // world
+    if auto_batch(args):
+        return "auto"
+    gbs = getattr(args, "global_batch_size", None)
+    if gbs is None:
+        return int(args.batch_size)
+    if int(gbs) % world:
+        raise SystemExit(f"--global-batch-size {gbs} is not divisible by the {world} GPUs of a run")
+    return int(gbs) // world
+
+
+def effective_global_batch(args: argparse.Namespace, world: int):
+    b = per_rank_batch_size(args, world)
+    return "auto" if b == "auto" else b * max(1, int(world))
+
+
+def batch_protocol(args: argparse.Namespace):
+    """The batch part of the study protocol: the fast trials' global batch, or the auto-batch settings."""
+    if auto_batch(args):
+        cands = ",".join(str(c) for c in sorted(set(args.auto_batch_candidates)))
+        return (f"auto(candidates={cands};gpus={args.fast_gpus_per_trial};mem_frac={args.auto_batch_mem_frac:g};"
+                f"tolerance={args.auto_batch_tolerance:g};lr={args.lr_batch_scaling}@{args.lr_ref_batch};"
+                f"lr_scaled_max={args.lr_scaled_max})")
+    return int(run_protocol(args, "fast")["global_batch"])
+
+
+def _proc_start_time(pid: int) -> Optional[str]:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 2:].split()[19]  # field 22: start time
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _descendants(pid: int) -> List[int]:
+    """All descendant pids of pid (Linux /proc)."""
+    children: Dict[int, List[int]] = {}
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            stat = (d / "stat").read_text()
+            ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(d.name))
+    out, todo = [], [pid]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            out.append(c)
+            todo.append(c)
+    return out
+
+
+def stop_process_tree(proc: subprocess.Popen, grace_seconds: float = 30.0) -> None:
+    """SIGTERM to a training run (torchrun or python) and all its descendants (DDP ranks, DataLoader workers), SIGKILL
+    to those still alive after grace_seconds. Does not block: the caller keeps reading the output until EOF."""
+    pids = [proc.pid] + _descendants(proc.pid)
+    started = {p: _proc_start_time(p) for p in pids}
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def kill_survivors():
+        time.sleep(grace_seconds)
+        for p, t0 in started.items():
+            if t0 is not None and _proc_start_time(p) == t0:  # same process, not a reused pid
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    threading.Thread(target=kill_survivors, daemon=True).start()
 
 
 def build_trial_ckpt_path(ckpt_dir: Path, save_base: str, run_id: str) -> Path:
@@ -427,6 +628,18 @@ def build_hparams(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, An
 
 
 def refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Namespace) -> Dict[str, Any]:
+    h = _refit_hparams_from_trial(trial, args)
+    if auto_batch(args) and "_global_batch" not in h:
+        # --batch-size auto: confirm runs and refit train with the global batch the trial was ranked with
+        g = trial.user_attrs.get("global_batch_size")
+        if g:
+            h["_global_batch"] = int(g)
+        else:
+            _log(f"[warn] trial {trial.number}: no recorded batch size; its re-runs probe the batch again")
+    return h
+
+
+def _refit_hparams_from_trial(trial: optuna.trial.FrozenTrial, args: argparse.Namespace) -> Dict[str, Any]:
     if is_baseline_trial(trial):
         return dict(trial.user_attrs["hparams"])
     p = dict(trial.params)
@@ -671,7 +884,7 @@ def build_command(
         "--asym-gamma-neg", str(hparams["asym_gamma_neg"]),
         "--target-fpr", str(args.target_fpr),
         "--num-workers", str(int(num_workers)),
-        "--batch-size", str(int(args.batch_size)),
+        "--batch-size", str(per_rank_batch_size(args, max(1, int(nproc)), hparams.get("_global_batch"))),
         "--max-open-h5-files", str(int(args.max_open_h5_files)),
         "--save", str(save_base),
         "--save-dir", str(save_path.parent),
@@ -690,6 +903,16 @@ def build_command(
         cmd += ["--gatv2-edge-attn"]
     else:
         cmd += ["--no-gatv2-edge-attn"]
+    if "_seed" in hparams:  # confirmation runs only: the same config with another seed
+        cmd += ["--seed", str(int(hparams["_seed"]))]
+    if cmd[cmd.index("--batch-size") + 1] == "auto":
+        cmd += ["--auto-batch-candidates", *[str(c) for c in args.auto_batch_candidates],
+                "--auto-batch-mem-frac", str(args.auto_batch_mem_frac),
+                "--auto-batch-tolerance", str(args.auto_batch_tolerance)]
+    if getattr(args, "lr_batch_scaling", "none") != "none":  # --lr is defined at the global batch --lr-ref-batch
+        cmd += ["--lr-batch-scaling", str(args.lr_batch_scaling), "--lr-ref-batch", str(int(args.lr_ref_batch))]
+        if args.lr_scaled_max is not None:
+            cmd += ["--lr-max", str(args.lr_scaled_max)]
     arch = {k: hparams.get(k, v) for k, v in ARCH_LEGACY_DEFAULTS.items()}
     cmd += [
         "--block", str(arch["block"]),
@@ -746,7 +969,10 @@ def run_one_training(
     env_extra: Optional[Dict[str, str]] = None,
     save_dir: Optional[Path] = None,
     trial_label: str = "",
+    on_epoch: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> int:
+    """Run one training, tee its output to log_path and stdout. on_epoch(row) is called with the metrics of every
+    epoch line; when it returns True the run is stopped (stop_process_tree) and its return code is returned."""
     env = os.environ.copy()
     if gpu_ids:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
@@ -779,7 +1005,7 @@ def run_one_training(
             text=True, bufsize=1,
         )
         assert proc.stdout is not None
-        last_epoch_summary = ""
+        stopping = False
         for line in proc.stdout:
             # Always write to log file
             log.write(line)
@@ -790,10 +1016,646 @@ def run_one_training(
             _sys.stdout.flush()
             # Also emit a highlighted marker for epoch lines
             if stripped.startswith("[epoch"):
-                last_epoch_summary = stripped
                 _log(f"  >> {trial_label} | {stripped}")
+                row = epoch_row_from_line(stripped)
+                if on_epoch is not None and row is not None and not stopping and on_epoch(row):
+                    stopping = True
+                    msg = f"[prune] {trial_label}: stopped after epoch {row['epoch']}\n"
+                    log.write(msg)
+                    log.flush()
+                    _log(msg.rstrip())
+                    stop_process_tree(proc)
         rc = proc.wait()
     return rc
+
+
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not Path(path).exists():
+        return []
+    out = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def arch_tag(h: Dict[str, Any]) -> str:
+    """Short architecture name of a trial: [layer type+] block [+relmp[-1way] [+edge-X]] +readout.
+    'legacy+global' = the current GATv2 model."""
+    parts = []
+    lt = h.get("layer_type", "gat_residual")
+    if lt != "gat_residual":
+        parts.append(str(lt))
+    parts.append(str(h.get("block", "legacy")))
+    if h.get("relation_mp"):
+        parts.append("relmp" + ("-1way" if h.get("calo_context") == "one_way" else ""))
+        if h.get("edge_update", "none") != "none":
+            parts.append(f"edge-{h['edge_update']}")
+    parts.append(str(h.get("readout", "global")))
+    return "+".join(parts)
+
+
+LEADERBOARD_LOCK = threading.Lock()
+LEADERBOARD_TOP = 30
+_IMPORTANCE_CACHE: Dict[str, Any] = {"n": -1, "value": None, "method": None}
+HPARAM_COLUMNS = ("lr", "hidden_dim", "layers", "gat_heads", "dropout", "weight_decay", "edge_dropout",
+                  "feat_noise_std", "loss_type", "label_smoothing", "focal_gamma", "focal_alpha", "asym_gamma_pos",
+                  "asym_gamma_neg", "block", "relation_mp", "calo_context", "edge_update", "readout", "pool", "fourier")
+
+
+def _param_importances(study) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    """Optuna parameter importances over the complete trials (fANOVA, needs scikit-learn; else PED-ANOVA); cached
+    per number of complete trials."""
+    n = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    if n < 10:
+        return None, None
+    if _IMPORTANCE_CACHE["n"] == n:
+        return _IMPORTANCE_CACHE["value"], _IMPORTANCE_CACHE["method"]
+    value, method = None, None
+    for method_name, make in (("fANOVA", lambda: None),
+                              ("PED-ANOVA", lambda: optuna.importance.PedAnovaImportanceEvaluator())):
+        try:
+            value = dict(optuna.importance.get_param_importances(study, evaluator=make()))
+            method = method_name
+            break
+        except Exception:
+            continue
+    _IMPORTANCE_CACHE.update(n=n, value=value, method=method)
+    return value, method
+
+
+def _fmt(v, nd: int = 4) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return "-"
+        return f"{v:.{nd}f}" if abs(v) >= 1e-3 or v == 0 else f"{v:.2e}"
+    return str(v)
+
+
+def _median(vals: List[float]) -> Optional[float]:
+    vals = sorted(vals)
+    if not vals:
+        return None
+    m = len(vals) // 2
+    return vals[m] if len(vals) % 2 else 0.5 * (vals[m - 1] + vals[m])
+
+
+def _most_common(vals: List[Any]) -> Any:
+    vals = [v for v in vals if v is not None]
+    return max(set(vals), key=vals.count) if vals else None
+
+
+def collect_leaderboard_rows(out_dir: Path, args: argparse.Namespace, study=None) -> Dict[str, Any]:
+    """Fast trials (trials.jsonl, the last record of every trial number) joined with the confirmed ranking
+    (confirm_summary.json) and the refits (refit.jsonl), sorted: complete by score, then pruned, then failed."""
+    maximize = metric_direction(args.compare_metric) == "maximize"
+    fast: Dict[int, Dict[str, Any]] = {}
+    for r in load_jsonl(out_dir / "trials.jsonl"):
+        if r.get("phase", "fast") == "fast" and r.get("trial_number") is not None:
+            fast[int(r["trial_number"])] = r
+    baseline_numbers, running = set(), 0
+    if study is not None:
+        for t in study.trials:
+            if is_baseline_trial(t):
+                baseline_numbers.add(t.number)
+            if t.state == optuna.trial.TrialState.RUNNING:
+                running += 1
+
+    confirm: Dict[int, Dict[str, Any]] = {}
+    confirm_meta: Dict[str, Any] = {}
+    cpath = out_dir / "confirm_summary.json"
+    if cpath.exists():
+        try:
+            cs = json.loads(cpath.read_text(encoding="utf-8"))
+            ranking = cs["ranking"] if isinstance(cs, dict) else cs
+            confirm_meta = cs if isinstance(cs, dict) else {}
+            for row in ranking:
+                confirm[int(row["trial_number"])] = row
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    refits: Dict[int, Dict[str, Any]] = {}
+    for r in load_jsonl(out_dir / "refit.jsonl"):
+        n = r.get("source_trial_number")
+        if n is None:
+            continue
+        ok = r.get("returncode") == 0 and r.get("objective_value") is not None
+        if ok or int(n) not in refits or refits[int(n)].get("returncode") != 0:
+            refits[int(n)] = r
+
+    rows = []
+    for n, r in fast.items():
+        h = r.get("hparams") or {}
+        pruned = bool(r.get("pruned"))
+        ok = r.get("returncode") == 0 and r.get("objective_value") is not None and not pruned
+        best = r.get("best_row") or {}
+        win = r.get("window_row") or best
+        info = r.get("run_info") or {}
+        c = confirm.get(n, {})
+        rf = refits.get(n, {})
+        rows.append({
+            "trial": n, "state": "complete" if ok else (f"pruned@{r.get('pruned_at_epoch')}" if pruned else
+                                                        f"failed(rc={r.get('returncode')})"),
+            "ok": ok, "pruned": pruned, "baseline": bool(r.get("baseline")) or n in baseline_numbers,
+            "arch": arch_tag(h), "score": safe_float(r.get("objective_value")),
+            "best_epoch_value": safe_float(r.get("best_epoch_value", best.get(args.compare_metric))),
+            "best_epoch": best.get("epoch"), "window_epochs": r.get("window_epochs"),
+            "auc": safe_float(win.get("val_auc")), "val_loss": safe_float(win.get("val_loss")),
+            "n_epochs": r.get("n_epochs_seen"), "minutes": (r.get("seconds") or 0.0) / 60.0,
+            "trainable_params": info.get("trainable_params"), "data_format": info.get("data_format"),
+            "sampler": info.get("sampler"), "indexing_seconds": info.get("indexing_seconds"),
+            "global_batch": info.get("global_batch_size"),
+            "confirm_mean": c.get("mean"), "confirm_sem": c.get("sem"), "confirm_n": c.get("n"),
+            "confirm_rank": c.get("rank"),
+            "refit_score": safe_float(rf.get("objective_value")) if rf.get("returncode") == 0 else None,
+            "refit_state": None if not rf else ("complete" if rf.get("returncode") == 0 else
+                                                f"failed(rc={rf.get('returncode')})"),
+            "refit_best_epoch": (rf.get("best_row") or {}).get("epoch"),
+            "hparams": h,
+        })
+
+    def key(row):
+        group = 0 if row["ok"] else (1 if row["pruned"] else 2)
+        s = row["score"]
+        return (group, s is None, -(s or 0.0) if maximize else (s or 0.0), row["trial"])
+
+    rows.sort(key=key)
+    rank = 0
+    for row in rows:
+        if row["ok"]:
+            rank += 1
+            row["rank"] = rank
+        else:
+            row["rank"] = None
+    return {"rows": rows, "running": running, "confirm_meta": confirm_meta, "refits": refits, "maximize": maximize}
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _leaderboard_markdown(res: Dict[str, Any], args: argparse.Namespace, study=None) -> str:
+    rows, maximize = res["rows"], res["maximize"]
+    ok = [r for r in rows if r["ok"]]
+    by_trial = {r["trial"]: r for r in rows}
+    n_pruned = sum(r["pruned"] for r in rows)
+    n_failed = len(rows) - len(ok) - n_pruned
+    metric = args.compare_metric
+    proto = (study.user_attrs.get("protocol") if study is not None else None) or {}  # the study's, else this run's
+    fast_gb = proto.get("fast_global_batch")
+    if fast_gb is None:
+        fast_gb = ("auto" if auto_batch(args) else None) or _most_common([r["global_batch"] for r in rows])
+    window = int(proto.get("objective_window", args.objective_window))
+    target_fpr = float(proto.get("target_fpr", args.target_fpr))
+    fast_epochs = proto.get("fast_epochs", args.fast_epochs)
+    fast_events = int(proto.get("fast_max_train_events", args.fast_max_train_events))
+    L = [f"# Leaderboard: study `{args.study_name}`", ""]
+    L.append(f"Updated {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}. Trials: {len(ok)} complete, "
+             f"{n_pruned} pruned, {n_failed} failed" + (f", {res['running']} running" if res["running"] else "") + ".")
+    L.append("")
+    score_txt = (f"`{metric}`" + (f" at FPR {target_fpr:g}" if metric == "val_tpr_at_target_fpr" else "")
+                 + " on the validation split, " + (f"mean of the best {window} consecutive epochs" if window > 1
+                                                   else "best single epoch")
+                 + f" ({'higher' if maximize else 'lower'} is better).")
+    L.append(f"- Score: {score_txt}")
+    pr = (study.user_attrs.get("pruning") if study is not None else None) or (
+        {"percentile": args.prune_percentile, "warmup_epochs": args.prune_warmup_epochs,
+         "startup_trials": args.prune_startup_trials} if args.prune else None)
+    batch_txt = (f"batch probed per architecture (column `batch`; confirm runs and refits keep it; column `lr` = "
+                 f"the lr at global batch {args.lr_ref_batch}, scaled {args.lr_batch_scaling} in the runs)"
+                 if isinstance(fast_gb, str) and fast_gb.startswith("auto") else
+                 f"global batch {fast_gb if fast_gb is not None else '?'}")
+    L.append(f"- Fast trials: {fast_epochs} epochs, "
+             f"{'all' if fast_events <= 0 else fast_events} training events, "
+             f"{batch_txt}; pruning "
+             + (f"on (stop below the best {pr['percentile']:g}% at the same epoch, from epoch "
+                f"{pr['warmup_epochs']}, after {pr['startup_trials']} complete trials)" if pr else "off")
+             + (f", {n_pruned} trials pruned" if n_pruned else "") + ".")
+    fmt_data = _most_common([r["data_format"] for r in rows])
+    if fmt_data is not None:
+        idx = _median([r["indexing_seconds"] for r in rows if r["indexing_seconds"] is not None])
+        L.append(f"- Data: {fmt_data}, sampler: {_most_common([r['sampler'] for r in rows])}, dataset indexing "
+                 f"median {_fmt(idx, 1)} s per trial.")
+    L.append("")
+
+    # best configuration
+    L.append("## Best configuration")
+    L.append("")
+    refit_ok = sorted([r for r in rows if r["refit_score"] is not None],
+                      key=lambda r: -r["refit_score"] if maximize else r["refit_score"])
+    cm = res["confirm_meta"]
+    confirmed = sorted([r for r in rows if r["confirm_mean"] is not None],
+                       key=lambda r: r["confirm_rank"] if r["confirm_rank"] is not None else 1e9)
+
+    def describe(r):
+        txt = f"trial {r['trial']}" + (" (trial 0: train-script defaults)" if r["baseline"] else "")
+        txt += f", `{r['arch']}`, fast {_fmt(r['score'])}"
+        if r["confirm_mean"] is not None:
+            txt += f", confirmed {_fmt(r['confirm_mean'])} ± {_fmt(r['confirm_sem'])} (n={r['confirm_n']})"
+        if r["refit_score"] is not None:
+            txt += f", refit {_fmt(r['refit_score'])}"
+        return txt
+
+    if refit_ok:
+        b = refit_ok[0]
+        L.append(f"**By refit score: {describe(b)}.**")
+        if len(refit_ok) > 1:
+            n2 = refit_ok[1]
+            L.append(f"Next refit: trial {n2['trial']} `{n2['arch']}` {_fmt(n2['refit_score'])} "
+                     f"(difference {_fmt(b['refit_score'] - n2['refit_score'])}; refits are single runs).")
+    elif confirmed:
+        b = confirmed[0]
+        L.append(f"**By confirmed mean: {describe(b)}.**")
+        fvs = cm.get("first_vs_second") if cm else None
+        if fvs and fvs.get("sigma") is not None:
+            L.append(f"#1 vs #2: {fvs['diff']:+.4f} ± {fvs['err']:.4f} ({fvs['sigma']:.1f} sigma).")
+        if cm and not cm.get("complete", True):
+            L.append(f"Confirm phase running: {cm.get('runs_finished')}/{cm.get('runs_total')} runs finished.")
+    elif ok:
+        b = ok[0]
+        L.append(f"**By fast score: {describe(b)}.** Single fast runs: confirm the top trials "
+                 "(--confirm-top-k) before choosing.")
+        if len(ok) > 1:
+            L.append(f"Top 5 span {_fmt(abs(ok[0]['score'] - ok[min(4, len(ok) - 1)]['score']))} in score.")
+    else:
+        L.append("No complete trial yet.")
+    base = [r for r in rows if r["baseline"]]
+    if base:
+        r0 = base[0]
+        L.append("")
+        L.append(f"Trial 0 (current best model, train-script defaults): {r0['state']}, score {_fmt(r0['score'])}, "
+                 f"rank {r0['rank'] if r0['rank'] is not None else '-'} of {len(ok)}.")
+    L.append("")
+
+    if res["refits"]:
+        L.append("## Refits (full training split)")
+        L.append("")
+        L.append("| refit score | trial | arch | state | best epoch | fast score | confirmed | minutes |")
+        L.append("|---:|---:|---|---|---:|---:|---|---:|")
+        for n, rf in sorted(res["refits"].items(), key=lambda kv: (
+                safe_float(kv[1].get("objective_value")) is None,
+                -(safe_float(kv[1].get("objective_value")) or 0.0) if maximize else
+                (safe_float(kv[1].get("objective_value")) or 0.0))):
+            r = by_trial.get(n, {})
+            conf = (f"{_fmt(r.get('confirm_mean'))} ± {_fmt(r.get('confirm_sem'))}"
+                    if r.get("confirm_mean") is not None else "-")
+            L.append(f"| {_fmt(safe_float(rf.get('objective_value')))} | {n} | {r.get('arch', arch_tag(rf.get('hparams') or {}))} | "
+                     f"{'complete' if rf.get('returncode') == 0 else 'failed'} | "
+                     f"{(rf.get('best_row') or {}).get('epoch', '-')} | {_fmt(r.get('score'))} | {conf} | "
+                     f"{_fmt((rf.get('seconds') or 0) / 60, 0)} |")
+        L.append("")
+
+    if confirmed:
+        p = cm.get("protocol") or {}
+        L.append("## Confirmed ranking")
+        L.append("")
+        if p:
+            L.append(f"Re-runs with new seeds: {p.get('epochs')} epochs, "
+                     f"{'all' if p.get('max_train_events', -1) <= 0 else p.get('max_train_events')} training events, "
+                     f"global batch {p.get('global_batch')}"
+                     + ("; the fast trial counts as one seed." if cm.get("includes_fast_value") else
+                        "; higher fidelity than the fast trials, so only the confirm runs count."))
+            L.append("")
+        L.append("| rank | trial | arch | mean | ± sem | n | fast score | refit |")
+        L.append("|---:|---:|---|---:|---:|---:|---:|---:|")
+        for r in confirmed:
+            L.append(f"| {r['confirm_rank']} | {r['trial']} | {r['arch']} | {_fmt(r['confirm_mean'])} | "
+                     f"{_fmt(r['confirm_sem'])} | {r['confirm_n']} | {_fmt(r['score'])} | {_fmt(r['refit_score'])} |")
+        L.append("")
+
+    if ok:
+        L.append("## Per architecture (complete fast trials)")
+        L.append("")
+        L.append("| arch | complete | pruned | best score | best trial | median | trainable params | batch |")
+        L.append("|---|---:|---:|---:|---:|---:|---:|---|")
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            groups.setdefault(r["arch"], []).append(r)
+        summary = []
+        for arch, rs in groups.items():
+            done = [r for r in rs if r["ok"]]
+            batches = sorted({r["global_batch"] for r in rs if r["global_batch"] is not None})
+            btxt = ",".join(str(b) for b in batches) if batches else "-"
+            if not done:
+                summary.append((arch, 0, sum(r["pruned"] for r in rs), None, None, None, None, btxt))
+                continue
+            best = done[0]  # rows are sorted by score
+            summary.append((arch, len(done), sum(r["pruned"] for r in rs), best["score"], best["trial"],
+                            _median([r["score"] for r in done]), best["trainable_params"], btxt))
+        summary.sort(key=lambda s: (s[3] is None, -(s[3] or 0.0) if maximize else (s[3] or 0.0)))
+        for arch, n_ok, n_pr, best, bt, med, npar, btxt in summary:
+            L.append(f"| {arch} | {n_ok} | {n_pr} | {_fmt(best)} | {bt if bt is not None else '-'} | {_fmt(med)} | "
+                     f"{npar if npar is not None else '-'} | {btxt} |")
+        L.append("")
+
+        L.append(f"## Fast trials (top {min(LEADERBOARD_TOP, len(ok))} of {len(ok)}; all trials in leaderboard.csv)")
+        L.append("")
+        L.append("| rank | trial | arch | score | best epoch | window | AUC | epochs | params | batch | lr | "
+                 "hidden x layers | loss | minutes | confirmed | refit |")
+        L.append("|---:|---:|---|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---:|---:|")
+        for r in ok[:LEADERBOARD_TOP]:
+            h = r["hparams"]
+            win = r["window_epochs"]
+            L.append(f"| {r['rank']} | {r['trial']}{' (defaults)' if r['baseline'] else ''} | {r['arch']} | "
+                     f"{_fmt(r['score'])} | {_fmt(r['best_epoch_value'])} @ {r['best_epoch']} | "
+                     f"{f'{win[0]}-{win[1]}' if win else '-'} | {_fmt(r['auc'])} | {r['n_epochs']} | "
+                     f"{r['trainable_params'] if r['trainable_params'] is not None else '-'} | "
+                     f"{r['global_batch'] if r['global_batch'] is not None else '-'} | {_fmt(h.get('lr'))} | "
+                     f"{h.get('hidden_dim')} x {h.get('layers')} | {h.get('loss_type')} | {_fmt(r['minutes'], 0)} | "
+                     f"{_fmt(r['confirm_mean'])} | {_fmt(r['refit_score'])} |")
+        L.append("")
+
+    if study is not None:
+        imp, method = _param_importances(study)
+        if imp:
+            L.append(f"## Parameter importances ({method}, complete trials)")
+            L.append("")
+            L.append("| parameter | importance |")
+            L.append("|---|---:|")
+            for k, v in sorted(imp.items(), key=lambda kv: -kv[1]):
+                L.append(f"| {k} | {v:.3f} |")
+            L.append("")
+    return "\n".join(L) + "\n"
+
+
+def _leaderboard_csv(rows: List[Dict[str, Any]], path: Path) -> None:
+    cols = ["rank", "trial", "state", "baseline", "arch", "score", "best_epoch_value", "best_epoch", "window_epochs",
+            "auc", "val_loss", "n_epochs", "minutes", "trainable_params", "confirm_rank", "confirm_mean",
+            "confirm_sem", "confirm_n", "refit_score", "refit_state", "refit_best_epoch", "global_batch",
+            "data_format", "indexing_seconds"]
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols + list(HPARAM_COLUMNS))
+        for r in rows:
+            win = r["window_epochs"]
+            vals = [r.get(c) for c in cols]
+            vals[cols.index("window_epochs")] = f"{win[0]}-{win[1]}" if win else ""
+            w.writerow(["" if v is None else v for v in vals] + ["" if r["hparams"].get(k) is None else r["hparams"][k]
+                                                               for k in HPARAM_COLUMNS])
+    os.replace(tmp, path)
+
+
+def write_leaderboard(out_dir: Path, args: argparse.Namespace, study=None, print_top: int = 0) -> Optional[Path]:
+    """Rewrite <out-dir>/leaderboard.md and leaderboard.csv; optionally print the top trials. Never raises (a
+    failure here must not stop the tuning)."""
+    try:
+        with LEADERBOARD_LOCK:
+            res = collect_leaderboard_rows(out_dir, args, study)
+            md = out_dir / "leaderboard.md"
+            _write_atomic(md, _leaderboard_markdown(res, args, study))
+            _leaderboard_csv(res["rows"], out_dir / "leaderboard.csv")
+        if print_top > 0:
+            ok = [r for r in res["rows"] if r["ok"]]
+            _log(f"  Leaderboard (top {min(print_top, len(ok))} of {len(ok)} complete; {md}):")
+            for r in ok[:print_top]:
+                _log(f"    #{r['rank']:<3} trial {r['trial']:<4} {args.compare_metric}={_fmt(r['score'], 5)}  "
+                     f"{r['arch']}" + ("  (train-script defaults)" if r["baseline"] else ""))
+        return md
+    except Exception as exc:  # pragma: no cover - reporting only
+        _log(f"[leaderboard] not written: {type(exc).__name__}: {exc}")
+        return None
+
+
+def run_protocol(args: argparse.Namespace, phase: str) -> Dict[str, Any]:
+    """Training protocol of a phase ('fast', 'confirm', 'refit'): epochs, training events, GPUs, global batch."""
+    n_dev = int(getattr(args, "n_devices", 0))
+    if phase == "fast":
+        epochs, events, gpus = args.fast_epochs, args.fast_max_train_events, args.fast_gpus_per_trial
+    elif phase == "confirm":
+        epochs = args.fast_epochs if args.confirm_epochs is None else args.confirm_epochs
+        events = args.fast_max_train_events if args.confirm_max_train_events is None else args.confirm_max_train_events
+        gpus = args.fast_gpus_per_trial if args.confirm_gpus_per_trial is None else args.confirm_gpus_per_trial
+    elif phase == "refit":
+        epochs, events, gpus = args.refit_epochs, args.refit_max_train_events, args.refit_gpus_per_trial
+    else:
+        raise ValueError(phase)
+    world = phase_world(gpus, n_dev)
+    return {"epochs": int(epochs), "max_train_events": int(events), "gpus_per_trial": int(gpus), "world": world,
+            "batch_size_per_rank": per_rank_batch_size(args, world), "global_batch": effective_global_batch(args, world)}
+
+
+def _same_training(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return all(a[k] == b[k] for k in ("epochs", "max_train_events", "global_batch"))
+
+
+def _protocol_tag(p: Dict[str, Any]) -> str:
+    n = p["max_train_events"]
+    return f"e{p['epochs']}_n{n if n > 0 else 'all'}_g{p['global_batch']}"
+
+
+def mean_std_sem(vals: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    n = len(vals)
+    if n == 0:
+        return None, None, None
+    mean = sum(vals) / n
+    if n < 2:
+        return mean, None, None
+    std = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5
+    return mean, std, std / n ** 0.5
+
+
+def confirm_top_trials(
+    *,
+    args: argparse.Namespace,
+    trials: list,
+    allocator: "GPUAllocator",
+    train_script: Path,
+    split_file: Path,
+    cwd: Path,
+    ckpt_dir: Path,
+    log_dir: Path,
+    out_dir: Path,
+    maximize: bool,
+    on_update: Optional[Callable[[], None]] = None,
+) -> list:
+    """Re-run the top --confirm-top-k fast trials with --confirm-seeds seeds each (in parallel like the fast phase)
+    and rank the configurations by the mean of their score over the seeds. One fast run is a single draw of the
+    training noise, and the best trials of a study often differ by less than that noise.
+    Fast protocol (default): the original fast trial counts as one seed, the new seeds are trainer seed + 100*s,
+    s = 1..N. Higher fidelity (--confirm-max-train-events / --confirm-epochs / --confirm-gpus-per-trial with another
+    global batch): only the N confirm runs count, seeds trainer seed + 100*s, s = 0..N-1 (s = 0: the fast trials'
+    seed). Finished runs are read back from <out-dir>/confirm.jsonl (a restarted tuner only runs what is missing);
+    <out-dir>/confirm_summary.json is rewritten after every run. Returns the ranked trials."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    k, n_seeds = int(args.confirm_top_k), int(args.confirm_seeds)
+    candidates = trials[:k]
+    if not candidates or n_seeds < 1:
+        return candidates
+    proto = run_protocol(args, "confirm")
+    fast_proto = run_protocol(args, "fast")
+    same = _same_training(proto, fast_proto)
+    seeds = list(range(1, n_seeds + 1)) if same else list(range(n_seeds))
+    tag = "" if same else _protocol_tag(proto) + "_"
+    results_path = out_dir / "confirm.jsonl"
+    done = {str(r.get("run_id")): r for r in load_jsonl(results_path)
+            if r.get("returncode") == 0 and r.get("objective_value") is not None}
+    lock = threading.Lock()
+    _banner(f"CONFIRM PHASE  —  top {len(candidates)} trials x {n_seeds} seed(s)  "
+            + (f"(fast protocol: {proto['epochs']} epochs, max_train_events={proto['max_train_events']}; "
+               "the fast trial counts as one seed)" if same else
+               f"(higher fidelity: {proto['epochs']} epochs, max_train_events={proto['max_train_events']}, "
+               f"global batch {proto['global_batch']}; fast trials: {fast_proto['epochs']} epochs, "
+               f"max_train_events={fast_proto['max_train_events']}, global batch {fast_proto['global_batch']})")
+            + ("; auto batch: every run keeps its trial's global batch" if auto_batch(args) else ""))
+
+    jobs = [(t, s) for t in candidates for s in seeds]
+    per_trial: Dict[int, List[float]] = {t.number: ([float(t.value)] if same else []) for t in candidates}
+    n_finished = [0]
+    summary_path = out_dir / "confirm_summary.json"
+
+    def rank_and_write(final: bool) -> list:
+        def key(t):
+            m = mean_std_sem(per_trial[t.number])[0]
+            return m if m is not None else (-math.inf if maximize else math.inf)
+
+        ranked = sorted(candidates, key=key, reverse=maximize)
+        rows = []
+        for rank, t in enumerate(ranked, start=1):
+            vals = per_trial[t.number]
+            mean, std, sem = mean_std_sem(vals)
+            h = _refit_hparams_from_trial(t, args)
+            rows.append({"rank": rank, "trial_number": t.number, "baseline": is_baseline_trial(t),
+                         "arch": arch_tag(h), "n": len(vals), "mean": mean, "std": std, "sem": sem,
+                         "fast_value": t.value, "values": vals, "global_batch": t.user_attrs.get("global_batch_size"),
+                         "hparams": {k: v for k, v in h.items() if not k.startswith("_")}})
+        first_vs_second = None
+        if len(rows) > 1 and rows[0]["sem"] is not None and rows[1]["sem"] is not None:
+            diff = rows[0]["mean"] - rows[1]["mean"]
+            err = (rows[0]["sem"] ** 2 + rows[1]["sem"] ** 2) ** 0.5
+            first_vs_second = {"diff": diff, "err": err, "sigma": abs(diff) / err if err > 0 else None}
+        summary = {"objective": args.compare_metric, "target_fpr": args.target_fpr,
+                   "objective_window": args.objective_window, "protocol": proto,
+                   "fidelity": "fast" if same else "higher", "includes_fast_value": same,
+                   "complete": final or n_finished[0] == len(jobs), "runs_finished": n_finished[0],
+                   "runs_total": len(jobs), "first_vs_second": first_vs_second, "ranking": rows}
+        tmp = summary_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, summary_path)
+        return ranked
+
+    def run_one(job_idx: int) -> None:
+        t, s = jobs[job_idx]
+        run_id = f"confirm_{tag}t{t.number:05d}_s{s}"
+        hparams = refit_hparams_from_trial(t, args)
+        hparams["_seed"] = int(args.trainer_seed) + 100 * s
+        if run_id in done:
+            value, rc = float(done[run_id]["objective_value"]), 0
+            _log(f"[confirm] {run_id}: done earlier → {args.compare_metric}={value}")
+        else:
+            save_path = build_trial_ckpt_path(ckpt_dir, args.save, run_id)
+            log_path = log_dir / f"{run_id}.log"
+            with allocator.acquire(proto["gpus_per_trial"]) as gpu_ids:
+                nproc = torchrun_nproc(proto["gpus_per_trial"], gpu_ids)
+                cmd = build_command(
+                    python_exe=os.environ.get("PYTHON", "python"), train_script=train_script,
+                    data_glob=args.data_glob, split_file=split_file, save_path=save_path, save_base=args.save,
+                    run_id=run_id, epochs=proto["epochs"], max_train_events=proto["max_train_events"],
+                    num_workers=args.num_workers, hparams=hparams, args=args, nproc=nproc,
+                    master_port=pick_master_port(args.master_port_base, 1500 + job_idx),
+                    rdzv_id=f"{re.sub(r'[^A-Za-z0-9_.-]', '_', args.study_name)}_{run_id}", resume=False,
+                )
+                t0 = time.time()
+                rc = run_one_training(cmd=cmd, log_path=log_path, gpu_ids=gpu_ids, cwd=cwd, save_dir=ckpt_dir,
+                                      trial_label=f"Confirm trial {t.number} seed {s}")
+                seconds = time.time() - t0
+            parsed = parse_best_metrics_from_log(log_path, args.compare_metric, args.objective_window)
+            value = parsed["objective_value"]
+            if value is None:
+                value = extract_objective_from_ckpt(read_ckpt_metrics(save_path), args.compare_metric)
+            with lock:
+                append_jsonl(results_path, {
+                    "phase": "confirm", "source_trial_number": t.number, "source_objective_value": t.value,
+                    "seed_idx": s, "seed": hparams["_seed"], "run_id": run_id, "returncode": rc, "seconds": seconds,
+                    "protocol": proto, "objective_name": args.compare_metric, "objective_value": value,
+                    "objective_window": args.objective_window, "best_epoch_value": parsed["best_epoch_value"],
+                    "window_epochs": parsed["window_epochs"], "best_row": parsed["best_row"],
+                    "window_row": parsed["window_row"], "n_epochs_seen": parsed["n_epochs_seen"],
+                    "run_info": parsed["run_info"],
+                    "hparams": {kk: v for kk, v in hparams.items() if not kk.startswith("_")},
+                    "ckpt_path": str(save_path), "log_path": str(log_path),
+                })
+            _log(f"[confirm] trial {t.number} seed {s}: rc={rc} {args.compare_metric}={value}")
+        with lock:
+            n_finished[0] += 1
+            if rc == 0 and value is not None:
+                per_trial[t.number].append(float(value))
+            rank_and_write(final=False)
+        if on_update is not None:
+            on_update()
+
+    with ThreadPoolExecutor(max_workers=max(1, int(args.n_jobs))) as pool:
+        list(pool.map(run_one, range(len(jobs))))
+
+    ranked = rank_and_write(final=True)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    _banner(f"CONFIRMED RANKING  ({args.compare_metric}: mean over seeds, sem = std/sqrt(n))")
+    _log(f"{'rank':>4} {'trial':>6} {'n':>2} {'mean':>9} {'sem':>8} {'std':>8} {'fast':>9}  {'arch':<40} values")
+    for row in summary["ranking"]:
+        f = lambda v: f"{v:.5f}" if v is not None else "-"
+        tag0 = "  (trial 0: train-script defaults)" if row["baseline"] else ""
+        _log(f"{row['rank']:>4} {row['trial_number']:>6} {row['n']:>2} {f(row['mean']):>9} {f(row['sem']):>8} "
+             f"{f(row['std']):>8} {f(row['fast_value']):>9}  {row['arch']:<40} "
+             + " ".join(f"{v:.5f}" for v in row["values"]) + tag0)
+    fvs = summary["first_vs_second"]
+    if fvs is not None:
+        _log(f"[confirm] #1 vs #2: diff={fvs['diff']:+.5f} +- {fvs['err']:.5f} "
+             f"({fvs['sigma']:.1f} sigma)" if fvs["sigma"] is not None else f"[confirm] #1 vs #2: diff={fvs['diff']:+.5f}")
+    _log(f"[confirm] summary: {summary_path}  runs: {results_path}")
+    if on_update is not None:
+        on_update()
+    return ranked
+
+
+def study_protocol(args: argparse.Namespace) -> Dict[str, Any]:
+    """The settings that define the score of a fast trial: they must stay the same within a study."""
+    return {"compare_metric": args.compare_metric, "target_fpr": float(args.target_fpr),
+            "objective_window": int(args.objective_window), "fast_epochs": int(args.fast_epochs),
+            "fast_max_train_events": int(args.fast_max_train_events),
+            "fast_global_batch": batch_protocol(args)}
+
+
+def check_study_protocol(study, args: argparse.Namespace, results_path: Path) -> None:
+    """Stored as the study user attr 'protocol' at the first run of a study; a later run (more trials, --refit-only,
+    confirm) with other values stops here, since its scores or confirm runs would not be comparable with the stored
+    trials. A study from before this record has none: its trials used the single best epoch (window 1)."""
+    proto = study_protocol(args)
+    stored = study.user_attrs.get("protocol")
+    finished = [t for t in study.trials
+                if t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)]
+    if stored is None:
+        if not finished:
+            study.set_user_attr("protocol", proto)
+            _log("[protocol] stored in the study: " + " ".join(f"{k}={v}" for k, v in proto.items()))
+            return
+        stored = {"objective_window": 1}
+        recs = [r for r in load_jsonl(results_path) if r.get("phase", "fast") == "fast"]
+        if recs:
+            stored["compare_metric"] = recs[0].get("objective_name")
+            stored["target_fpr"] = safe_float(recs[0].get("target_fpr"))
+        _log("[protocol] study from before the protocol record: checking only "
+             + " ".join(f"{k}={v}" for k, v in stored.items() if v is not None))
+    diff = {k: (stored.get(k), proto[k]) for k in proto if stored.get(k) is not None and stored.get(k) != proto[k]}
+    if diff:
+        flags = {"compare_metric": "--compare-metric", "target_fpr": "--target-fpr",
+                 "objective_window": "--objective-window", "fast_epochs": "--fast-epochs",
+                 "fast_max_train_events": "--fast-max-train-events",
+                 "fast_global_batch": "--global-batch-size (or --batch-size x --fast-gpus-per-trial; --batch-size "
+                                      "auto: --auto-batch-* / --lr-batch-scaling / --lr-ref-batch / --lr-scaled-max)"}
+        raise SystemExit("[protocol] study '" + str(args.study_name) + "' was run with other settings: "
+                         + "; ".join(f"{flags[k]}: study {a}, this run {b}" for k, (a, b) in diff.items())
+                         + ". Pass the study's values (or use a new --study-name / --out-dir).")
 
 
 def validate_inputs(args: argparse.Namespace) -> None:
@@ -911,7 +1773,13 @@ def main() -> None:
     ap.add_argument("--sqlite-timeout", type=float, default=120.0, help="SQLite lock wait timeout in seconds.")
     ap.add_argument("--study-name", default="dv_classifier_tpr_fpr1")
     ap.add_argument("--compare-metric", default="val_tpr_at_target_fpr", choices=["val_loss", "val_auc", "val_acc", "val_f1", "val_balanced_acc", "val_tpr_at_target_fpr"])
-    ap.add_argument("--target-fpr", type=float, default=0.01, help="FPR working point. 0.01 means 1%% FPR.")
+    ap.add_argument("--target-fpr", type=float, default=0.001,
+                    help="FPR working point of val_tpr_at_target_fpr: 0.001 = 0.1%% background (default since "
+                         "2026-11-24; before: 0.01).")
+    ap.add_argument("--objective-window", type=int, default=1,
+                    help="Trial score = best mean of the metric over this many consecutive epochs (1: the single "
+                         "best epoch, the former score; 3 is less biased by the epoch-to-epoch noise). The same in "
+                         "the fast, confirm and refit phases; stored in the study.")
     ap.add_argument("--n-trials", type=int, default=50,
                     help="Total number of completed fast trials desired in the study. On resume, only the missing trials are launched.")
     ap.add_argument("--n-trials-extra", action="store_true", default=False,
@@ -923,14 +1791,61 @@ def main() -> None:
     ap.add_argument("--fast-gpus-per-trial", type=int, default=1)
     ap.add_argument("--trial-launch-stagger-seconds", type=float, default=15.0,
                     help="Delay between concurrent trial launches to avoid HDF5/EOS/DDP startup stampedes.")
+    ap.add_argument("--prune", action="store_true", default=False,
+                    help="Stop fast trials whose running score is outside the best --prune-percentile %% of the "
+                         "complete trials at the same epoch (Optuna PercentilePruner); trial 0 is never pruned.")
+    ap.add_argument("--prune-warmup-epochs", type=int, default=10, help="No pruning before this epoch.")
+    ap.add_argument("--prune-startup-trials", type=int, default=8,
+                    help="No pruning before this many complete trials; also the minimum number of complete trials "
+                         "with a value at the epoch.")
+    ap.add_argument("--prune-percentile", type=float, default=50.0,
+                    help="Trials outside the best this %% at the same epoch are stopped (50 = median pruner).")
     ap.add_argument("--refit-top-k", type=int, default=0)
+    ap.add_argument("--confirm-top-k", "--confirm-topk", dest="confirm_top_k", type=int, default=0,
+                    help="Before the refit: re-run the top K fast trials with --confirm-seeds new seeds each (fast "
+                         "protocol) and rank them by the mean over the seeds (the fast trial counts as one); the "
+                         "refit then takes its --refit-top-k from this ranking. 0: off.")
+    ap.add_argument("--confirm-epochs", type=int, default=None, help="Epochs of a confirm run (default: --fast-epochs).")
+    ap.add_argument("--confirm-max-train-events", type=int, default=None,
+                    help="Training events of a confirm run (default: --fast-max-train-events). More events than the "
+                         "fast trials = a higher-fidelity check (only the confirm runs are then averaged).")
+    ap.add_argument("--confirm-gpus-per-trial", type=int, default=None,
+                    help="GPUs per confirm run (default: --fast-gpus-per-trial).")
+    ap.add_argument("--confirm-seeds", type=int, default=2,
+                    help="New seeds per confirmed config (trainer --seed = train-script default + 100 * i).")
     ap.add_argument("--refit-epochs", type=int, default=100)
     ap.add_argument("--refit-max-train-events", type=int, default=-1)
     ap.add_argument("--refit-gpus-per-trial", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--batch-size", type=int, default=None,
-                    help="Graphs per GPU step passed to the trainer. Default: the train script's default "
-                         "(64, as the best model); the old studies used 16.")
+    ap.add_argument("--batch-size", type=tuner_batch_arg, default=None,
+                    help="Graphs per GPU step passed to the trainer, the same in every phase (so the global batch "
+                         "grows with the GPUs of a run). Default: the train script's default (64, as the best "
+                         "model); the old studies used 16. Not with --global-batch-size. "
+                         "'auto': every searched fast trial probes --auto-batch-candidates per GPU for its own "
+                         "architecture (the trainer takes the fastest that fits --auto-batch-mem-frac), --lr is "
+                         "scaled from the global batch --lr-ref-batch (--lr-batch-scaling, default sqrt), and the "
+                         "trial's confirm runs and refit keep its global batch (split over their GPUs). Trial 0 "
+                         "runs at --lr-ref-batch.")
+    ap.add_argument("--auto-batch-candidates", type=int, nargs="+", default=[16, 32, 64, 128],
+                    help="--batch-size auto: per-GPU batch sizes probed by the trainer.")
+    ap.add_argument("--auto-batch-mem-frac", type=float, default=0.7,
+                    help="--batch-size auto: the worst-case batch must stay under this fraction of the GPU memory.")
+    ap.add_argument("--auto-batch-tolerance", type=float, default=0.05,
+                    help="--batch-size auto: sizes within this fraction of the best throughput count as equal; the "
+                         "smallest wins.")
+    ap.add_argument("--lr-batch-scaling", default=None, choices=["none", "sqrt", "linear"],
+                    help="Forwarded to the trainer (all phases): --lr is defined at the global batch --lr-ref-batch "
+                         "and scaled to the global batch of the run (the EMA decay too). Default: sqrt with "
+                         "--batch-size auto, none otherwise.")
+    ap.add_argument("--lr-ref-batch", type=int, default=None,
+                    help="Global batch at which the searched --lr is defined (default: the trainer's, 64).")
+    ap.add_argument("--lr-scaled-max", type=float, default=None,
+                    help="Forwarded as the trainer's --lr-max: cap on the batch-scaled lr (default: none). Not the "
+                         "search range (--lr-min / --lr-max, defined at --lr-ref-batch).")
+    ap.add_argument("--global-batch-size", type=int, default=None,
+                    help="Graphs per optimizer step summed over the GPUs of a run, the same in every phase: a run "
+                         "on k GPUs gets N/k per GPU, so the refit sees the batch the fast trials were tuned at "
+                         "(the old study refitted at 4x the fast-trial batch). Stored in the study.")
     ap.add_argument("--max-open-h5-files", type=int, default=16,
                     help="Maximum HDF5 files open per trainer process.")
     ap.add_argument("--pin-memory", action="store_true", default=False)
@@ -951,6 +1866,9 @@ def main() -> None:
     ap.add_argument("--resume-skip-existing", dest="resume_skip_existing", action="store_true", default=True,
                     help="If the expected checkpoint for a trial already exists, reuse its saved metric instead of rerunning it.")
     ap.add_argument("--no-resume-skip-existing", dest="resume_skip_existing", action="store_false")
+    ap.add_argument("--report-only", action="store_true", default=False,
+                    help="Only rewrite <out-dir>/leaderboard.md / .csv from the study and the jsonl files, then exit "
+                         "(no training; also while the study runs).")
     ap.add_argument("--refit-only", action="store_true", default=False,
                     help="Skip fast Optuna optimization and only refit the current best completed trials.")
     ap.add_argument("--extra-train-args", default="", help="Extra quoted arguments appended to every train command")
@@ -1038,15 +1956,53 @@ def main() -> None:
     args.fixed_relation_mp = None if str(args.fixed_relation_mp).lower() == "any" else \
         str(args.fixed_relation_mp).lower() in ("1", "true", "yes", "y")
     trainer_defaults = read_trainer_defaults(Path(args.train_script))
+    if args.global_batch_size is not None:
+        if args.batch_size is not None:
+            raise SystemExit("--batch-size (per GPU) and --global-batch-size (summed over the GPUs) exclude each other")
+        if args.global_batch_size < 1:
+            raise SystemExit("--global-batch-size must be >= 1")
+    if auto_batch(args):
+        if args.global_batch_size is not None:
+            raise SystemExit("--batch-size auto and --global-batch-size exclude each other")
+        if min(args.auto_batch_candidates) < 1:
+            raise SystemExit("--auto-batch-candidates must be >= 1")
     if args.batch_size is None:
         args.batch_size = int(trainer_defaults.get("batch_size", 16))
+    if args.lr_batch_scaling is None:
+        args.lr_batch_scaling = "sqrt" if auto_batch(args) else "none"
+    if args.lr_ref_batch is None:
+        args.lr_ref_batch = int(trainer_defaults.get("lr_ref_batch", trainer_defaults.get("batch_size", 64)))
+    if args.lr_ref_batch < 1 or (args.lr_scaled_max is not None and args.lr_scaled_max <= 0):
+        raise SystemExit("--lr-ref-batch must be >= 1 and --lr-scaled-max > 0")
+    if args.objective_window < 1:
+        raise SystemExit("--objective-window must be >= 1")
+    if not 0.0 < args.prune_percentile <= 100.0:
+        raise SystemExit("--prune-percentile must be in (0, 100]")
     args.baseline_hparams = trainer_baseline_hparams(trainer_defaults)
+    args.trainer_seed = int(trainer_defaults.get("seed", 12345))  # seed of the fast trials and refits
 
     out_dir = Path(args.out_dir).resolve()
     mkdir(out_dir)
+    if args.storage_backend == "auto" and not args.storage_url and not args.storage_path:
+        # an existing study keeps its storage file, whatever --n-jobs this run uses
+        existing = [b for b, f in (("journal", "optuna.journal"), ("sqlite", "optuna.db")) if (out_dir / f).exists()]
+        if len(existing) == 1:
+            args.storage_backend = existing[0]
+    if args.report_only:
+        args.n_devices = 0
+        try:
+            study = optuna.load_study(study_name=args.study_name, storage=build_optuna_storage(args, out_dir))
+        except Exception as exc:
+            print(f"[report] no Optuna study {args.study_name!r} in {out_dir} ({type(exc).__name__}: {exc}); "
+                  "leaderboard from the jsonl files only")
+            study = None
+        md = write_leaderboard(out_dir, args, study, print_top=10)
+        print(f"[report] {md}  and  {out_dir / 'leaderboard.csv'}")
+        return
     validate_inputs(args)
 
     devices = detect_gpus()
+    args.n_devices = len(devices)
     actual_cuda_devices = int(torch.cuda.device_count())
     if devices and actual_cuda_devices < len(devices):
         raise RuntimeError(
@@ -1055,7 +2011,8 @@ def main() -> None:
             "Check for malformed, wrapped, unavailable, or duplicate GPU/MIG identifiers. "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
         )
-    requested_gpus = max(int(args.fast_gpus_per_trial), int(args.refit_gpus_per_trial))
+    requested_gpus = max(int(args.fast_gpus_per_trial), int(args.refit_gpus_per_trial),
+                         int(args.confirm_gpus_per_trial or 0))
     if devices and requested_gpus > actual_cuda_devices:
         raise RuntimeError(
             f"Requested up to {requested_gpus} GPU(s) per trial, but PyTorch can use only "
@@ -1063,7 +2020,49 @@ def main() -> None:
         )
     allocator = GPUAllocator(devices)
     print(f"[i] visible GPUs: {devices if devices else 'none; running train script without torchrun'}")
-    print(f"[i] objective: {args.compare_metric}; target_fpr={args.target_fpr}")
+    print(f"[i] objective: {args.compare_metric}; target_fpr={args.target_fpr}; trial score = "
+          + (f"best mean over {args.objective_window} consecutive epochs" if args.objective_window > 1
+             else "best single epoch"))
+    phases = ["fast"] + (["confirm"] if args.confirm_top_k > 0 else []) + (["refit"] if args.refit_top_k > 0 else [])
+    if auto_batch(args):
+        # every global batch a trial can get (candidates x fast GPUs; trial 0: --lr-ref-batch) must split evenly
+        # over the GPUs of its confirm runs and refit
+        fast_world = run_protocol(args, "fast")["world"]
+        globals_ = sorted({int(c) * fast_world for c in args.auto_batch_candidates} | {int(args.lr_ref_batch)})
+        for ph in phases:
+            w = run_protocol(args, ph)["world"]
+            bad = [g for g in globals_ if g % w]
+            if bad:
+                raise SystemExit(f"--batch-size auto: the global batches {bad} (--auto-batch-candidates x "
+                                 f"{fast_world} fast GPU(s), or --lr-ref-batch) do not split over the {w} GPUs of the "
+                                 f"{ph} runs: change --auto-batch-candidates / --lr-ref-batch or the GPUs per run")
+        print(f"[i] batch (auto, per architecture): fast trials probe {sorted(set(args.auto_batch_candidates))} per "
+              f"GPU on {fast_world} GPU(s) (mem frac {args.auto_batch_mem_frac:g}, tolerance "
+              f"{args.auto_batch_tolerance:g}); trial 0: global {args.lr_ref_batch}; confirm runs and refits keep "
+              f"the trial's global batch, split over their GPUs")
+    else:
+        batch_txt = []
+        for ph in phases:
+            pr = run_protocol(args, ph)  # raises if --global-batch-size does not divide
+            batch_txt.append(f"{ph} {pr['world']} GPU(s) x {pr['batch_size_per_rank']} = {pr['global_batch']}")
+        print(f"[i] batch ({'--global-batch-size' if args.global_batch_size is not None else '--batch-size per GPU'}): "
+              + " | ".join(batch_txt))
+    if args.lr_batch_scaling != "none":
+        print(f"[i] lr: the searched lr is defined at global batch {args.lr_ref_batch}, scaled "
+              f"{args.lr_batch_scaling} to the global batch of each run"
+              + (f" (capped at {args.lr_scaled_max:g})" if args.lr_scaled_max is not None else "")
+              + "; the EMA decay too")
+    if args.global_batch_size is None and len({run_protocol(args, ph)["global_batch"] for ph in phases}) > 1:
+        print("[w] the phases train with different global batches (--batch-size is per GPU): the learning rate of "
+              "the fast trials is not the one the refit needs; --global-batch-size keeps it the same.")
+    if args.prune:
+        print(f"[i] pruning: stop trials outside the best {args.prune_percentile:g}% of the complete trials at the "
+              f"same epoch, from epoch {args.prune_warmup_epochs}, after {args.prune_startup_trials} complete trials")
+    data_paths = glob.glob(args.data_glob)
+    if data_paths and not any(Path(x).name.endswith(".packed") for x in data_paths):
+        print("[w] the data are H5 parts: every trial re-indexes them (old study: median 41 min per trial) and its "
+              "batches mix only --max-open-h5-files files. Packed parts (DisplacedVertex_converter.py default, or "
+              "pack_DisplacedVertex_dataset.py) remove both.")
     print(f"[i] loss search space: {args.loss_types if not args.fixed_loss_type else [args.fixed_loss_type]}")
     print(f"[i] search space: lr [{args.lr_min:g}, {args.lr_max:g}] log | hidden {args.hidden_dims} | "
           f"layers [{args.layers_min}, {args.layers_max}] | dropout [{args.dropout_min:g}, {args.dropout_max:g}] | "
@@ -1089,6 +2088,15 @@ def main() -> None:
 
     storage = build_optuna_storage(args, out_dir)
     direction = metric_direction(args.compare_metric)
+    maximize = direction == "maximize"
+    pruner = optuna.pruners.NopPruner()
+    if args.prune:
+        # PercentilePruner(p): stop a trial whose best reported value so far is outside the best p% of the complete
+        # trials' values at the same step (an epoch; the reported value is the running score, see on_epoch).
+        pruner = optuna.pruners.PercentilePruner(
+            float(args.prune_percentile), n_startup_trials=max(1, int(args.prune_startup_trials)),
+            n_warmup_steps=max(0, int(args.prune_warmup_epochs)), interval_steps=1,
+            n_min_trials=max(1, int(args.prune_startup_trials)))
     study = optuna.create_study(
         study_name=args.study_name,
         storage=storage,
@@ -1099,6 +2107,7 @@ def main() -> None:
             seed=12345,
             n_startup_trials=max(1, int(args.n_startup_trials)) + (1 if args.baseline_trial else 0),
         ),
+        pruner=pruner,
     )
 
     train_script = Path(args.train_script).resolve()
@@ -1109,6 +2118,8 @@ def main() -> None:
     log_dir = out_dir / "logs"
     mkdir(ckpt_dir)
     mkdir(log_dir)
+    check_study_protocol(study, args, results_path)
+    write_leaderboard(out_dir, args, study)
 
     # Track best value seen so far for the running leaderboard
     _best_so_far: Dict[str, Any] = {"value": None, "trial": None}
@@ -1118,6 +2129,8 @@ def main() -> None:
             if trial.user_attrs.get("baseline_has_params"):
                 build_hparams(trial, args)  # registers the enqueued params (= the defaults) for TPE
             hparams = dict(args.baseline_hparams)
+            if auto_batch(args):  # trial 0 = the defaults, at the global batch where --lr is defined
+                hparams["_global_batch"] = int(args.lr_ref_batch)
             trial.set_user_attr("hparams", hparams)
         else:
             hparams = build_hparams(trial, args)
@@ -1137,6 +2150,7 @@ def main() -> None:
         _log(f"  run_id : {run_id}")
         _log(f"  epochs : {args.fast_epochs}")
         _log(f"  objective: {args.compare_metric}")
+        _log(f"  arch   : {arch_tag(hparams)}" + ("  (trial 0: train-script defaults)" if is_baseline_trial(trial) else ""))
         _log(f"  Hyperparameters:")
         for k, v in sorted(hparams.items()):
             _log(f"    {k:<22} = {v}")
@@ -1174,17 +2188,41 @@ def main() -> None:
                 rdzv_id=rdzv_id,
                 resume=False,
             )
+            # every epoch: report the running score (= the final score if the trial ended here) to Optuna; with
+            # --prune, stop the trial when the pruner says so (never trial 0)
+            epoch_values: List[Optional[float]] = []
+            prune_state: Dict[str, Any] = {"epoch": None, "value": None}
+            baseline = is_baseline_trial(trial)
+
+            def on_epoch(row: Dict[str, Any]) -> bool:
+                epoch_values.append(row.get(args.compare_metric))
+                value, _ = windowed_best(epoch_values, args.objective_window, maximize)
+                if value is None:
+                    return False
+                try:
+                    trial.report(float(value), step=int(row["epoch"]))
+                    if args.prune and not baseline and trial.should_prune():
+                        prune_state.update(epoch=int(row["epoch"]), value=float(value))
+                        return True
+                except Exception as exc:  # storage hiccup: keep training, never prune on an error
+                    _log(f"[warn] {trial_label}: Optuna report failed at epoch {row.get('epoch')}: {exc}")
+                return False
+
             t0 = time.time()
             _log(f"[run]  Training subprocess launched...")
             rc = run_one_training(
                 cmd=cmd, log_path=log_path, gpu_ids=gpu_ids,
-                cwd=cwd, save_dir=ckpt_dir, trial_label=trial_label,
+                cwd=cwd, save_dir=ckpt_dir, trial_label=trial_label, on_epoch=on_epoch,
             )
             seconds = time.time() - t0
 
         # ── Parse results ─────────────────────────────────────────────────
-        parsed = parse_best_metrics_from_log(log_path, args.compare_metric)
+        pruned = prune_state["epoch"] is not None
+        parsed = parse_best_metrics_from_log(log_path, args.compare_metric, args.objective_window)
         objective_value = parsed["objective_value"]
+        if parsed["run_info"].get("global_batch_size"):
+            # the batch the trial was ranked with (--batch-size auto: probed for its architecture)
+            trial.set_user_attr("global_batch_size", int(parsed["run_info"]["global_batch_size"]))
         if objective_value is None:
             for candidate_ckpt in (save_path, legacy_duplicated_ckpt_path(save_path, run_id)):
                 objective_value = extract_objective_from_ckpt(
@@ -1203,9 +2241,18 @@ def main() -> None:
             "objective_name": args.compare_metric,
             "objective_value": objective_value,
             "target_fpr": args.target_fpr,
+            "objective_window": args.objective_window,
+            "best_epoch_value": parsed["best_epoch_value"],
+            "window_epochs": parsed["window_epochs"],
+            "window_row": parsed["window_row"],
             "best_row": parsed["best_row"],
             "last_row": parsed["last_row"],
             "n_epochs_seen": parsed["n_epochs_seen"],
+            "run_info": parsed["run_info"],
+            "protocol": run_protocol(args, "fast"),
+            "baseline": baseline,
+            "pruned": pruned,
+            "pruned_at_epoch": prune_state["epoch"],
             "hparams": hparams,
             "ckpt_path": str(save_path),
             "log_path": str(log_path),
@@ -1214,11 +2261,15 @@ def main() -> None:
 
         # ── Trial complete banner ─────────────────────────────────────────
         _banner(f"TRIAL {trial.number} FINISHED  [{datetime.now().strftime('%H:%M:%S')}]", char="─")
-        status = "✓ OK" if rc == 0 else f"✗ FAILED (rc={rc})"
+        status = (f"✂ PRUNED after epoch {prune_state['epoch']}" if pruned else
+                  "✓ OK" if rc == 0 else f"✗ FAILED (rc={rc})")
         _log(f"  status         : {status}")
         _log(f"  elapsed        : {seconds/60:.1f} min ({seconds:.0f}s)")
         _log(f"  epochs seen    : {parsed['n_epochs_seen']}")
         _log(f"  {args.compare_metric:<20} = {objective_value if objective_value is not None else 'N/A'}")
+        if parsed.get("window_epochs") and args.objective_window > 1:
+            _log(f"  score window   : epochs {parsed['window_epochs'][0]}-{parsed['window_epochs'][1]} "
+                 f"(single best epoch: {parsed['best_epoch_value']:.5f})")
         if parsed.get("best_row"):
             br = parsed["best_row"]
             _log(f"  best epoch     : {br.get('epoch', '?')}")
@@ -1226,6 +2277,13 @@ def main() -> None:
                 v = br.get(k)
                 if v is not None:
                     _log(f"    {k:<28} = {v:.5f}")
+
+        if pruned:
+            trial.set_user_attr("pruned_at_epoch", prune_state["epoch"])
+            write_leaderboard(out_dir, args, study)
+            _log(SEP2)
+            raise optuna.exceptions.TrialPruned(
+                f"pruned after epoch {prune_state['epoch']}: running score {prune_state['value']:.5f}")
 
         # ── Update and print running best-so-far leaderboard ─────────────
         if objective_value is not None:
@@ -1244,6 +2302,7 @@ def main() -> None:
                 _log(f"  ★ NEW BEST! Trial {trial.number} → {args.compare_metric} = {objective_value:.5f}")
             else:
                 _log(f"  ★ Best so far: Trial {_best_so_far['trial']} → {args.compare_metric} = {_best_so_far['value']:.5f}")
+        write_leaderboard(out_dir, args, study, print_top=5)
         _log(SEP2)
 
         if rc != 0 or objective_value is None:
@@ -1256,15 +2315,18 @@ def main() -> None:
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None and not is_baseline_trial(t)
     ]
+    # trials stopped by the pruner count as done for --n-trials (failed trials do not)
+    n_pruned_done = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
+                        and t.user_attrs.get("pruned_at_epoch") is not None and not is_baseline_trial(t))
     if args.refit_only:
         _log("[mode] --refit-only set: skipping FAST Optuna optimization.")
     else:
         if args.n_trials_extra:
             n_to_run = int(args.n_trials)
         else:
-            n_to_run = max(0, int(args.n_trials) - len(complete_trials))
+            n_to_run = max(0, int(args.n_trials) - len(complete_trials) - n_pruned_done)
         _banner(
-            f"OPTUNA SEARCH  |  completed={len(complete_trials)}  "
+            f"OPTUNA SEARCH  |  completed={len(complete_trials)}  pruned={n_pruned_done}  "
             f"requested={args.n_trials}  launching={n_to_run}  "
             f"objective={args.compare_metric}"
         )
@@ -1278,6 +2340,10 @@ def main() -> None:
             _log("[baseline] enqueued the train-script-default trial as the next trial" +
                  ("" if params is not None else f" (no Optuna params: {why}; TPE skips it)"))
         if n_to_run > 0:
+            if args.prune:  # shown in the leaderboard (also by later --refit-only / --report-only runs)
+                study.set_user_attr("pruning", {"percentile": float(args.prune_percentile),
+                                                "warmup_epochs": int(args.prune_warmup_epochs),
+                                                "startup_trials": int(args.prune_startup_trials)})
             study.optimize(objective, n_trials=n_to_run, n_jobs=args.n_jobs, gc_after_trial=True)
 
     complete_trials = [
@@ -1295,10 +2361,20 @@ def main() -> None:
     else:
         _log("  No completed trials — check the latest log files for training failures.")
 
+    trials = [t for t in study.trials if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE]
+    trials.sort(key=lambda t: t.value, reverse=direction == "maximize")
+    if args.confirm_top_k > 0 and complete_trials:
+        if args.refit_top_k > args.confirm_top_k:
+            _log(f"[warn] --refit-top-k {args.refit_top_k} > --confirm-top-k {args.confirm_top_k}: "
+                 f"refitting only the {args.confirm_top_k} confirmed configs.")
+        trials = confirm_top_trials(
+            args=args, trials=trials, allocator=allocator, train_script=train_script, split_file=split_file,
+            cwd=cwd, ckpt_dir=ckpt_dir, log_dir=log_dir, out_dir=out_dir, maximize=direction == "maximize",
+            on_update=lambda: write_leaderboard(out_dir, args, study),
+        )
+        _log(f"[refit] using the confirmed ranking: trials {[t.number for t in trials[:args.refit_top_k]]}")
+
     if args.refit_top_k > 0 and complete_trials:
-        trials = [t for t in study.trials if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE]
-        reverse = direction == "maximize"
-        trials.sort(key=lambda t: t.value, reverse=reverse)
         finalists = trials[: args.refit_top_k]
         refit_results = out_dir / "refit.jsonl"
         _banner(f"REFIT PHASE  —  top {len(finalists)} trials  ({args.refit_epochs} epochs each)")
@@ -1315,6 +2391,7 @@ def main() -> None:
                 f"fast_score={t.value:.5f}  [{datetime.now().strftime('%H:%M:%S')}]",
                 char="─",
             )
+            _log(f"  arch   : {arch_tag(hparams)}")
             _log(f"  Hyperparameters:")
             for k, v in sorted(hparams.items()):
                 _log(f"    {k:<22} = {v}")
@@ -1344,7 +2421,7 @@ def main() -> None:
                     cwd=cwd, save_dir=ckpt_dir, trial_label=trial_label,
                 )
                 seconds = time.time() - t0
-            parsed = parse_best_metrics_from_log(log_path, args.compare_metric)
+            parsed = parse_best_metrics_from_log(log_path, args.compare_metric, args.objective_window)
             _log(f"  [refit {rank}] elapsed={seconds/60:.1f} min | "
                  f"{args.compare_metric}={parsed['objective_value']}")
             append_jsonl(refit_results, {
@@ -1357,12 +2434,24 @@ def main() -> None:
                 "objective_name": args.compare_metric,
                 "objective_value": parsed["objective_value"],
                 "target_fpr": args.target_fpr,
+                "objective_window": args.objective_window,
+                "best_epoch_value": parsed["best_epoch_value"],
+                "window_epochs": parsed["window_epochs"],
+                "window_row": parsed["window_row"],
                 "best_row": parsed["best_row"],
                 "last_row": parsed["last_row"],
+                "n_epochs_seen": parsed["n_epochs_seen"],
+                "run_info": parsed["run_info"],
+                "protocol": run_protocol(args, "refit"),
                 "hparams": hparams,
                 "ckpt_path": str(save_path),
                 "log_path": str(log_path),
             })
+            write_leaderboard(out_dir, args, study)
+
+    md = write_leaderboard(out_dir, args, study, print_top=10)
+    if md is not None:
+        _log(f"[leaderboard] {md}  and  {out_dir / 'leaderboard.csv'}")
 
 
 if __name__ == "__main__":

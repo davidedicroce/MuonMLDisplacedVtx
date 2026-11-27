@@ -3283,6 +3283,104 @@ def _evaluate_classifier(
     return metrics
 
 
+def batch_size_arg(value):
+    """--batch-size: a positive integer (graphs per GPU step) or 'auto'."""
+    if str(value).lower() == "auto":
+        return "auto"
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"must be an integer or 'auto', got {value!r}")
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return v
+
+
+def _graph_size(item: Dict[str, Any]) -> int:
+    """Nodes + edges of one event (all node and edge blocks): the memory proxy that picks the worst-case batch."""
+    n = 0
+    for k, v in item.items():
+        if not torch.is_tensor(v) or v.ndim == 0:
+            continue
+        if k.endswith("edge_index"):
+            n += int(v.shape[-1])
+        elif k in ("x", "track_x", "tracklet_x"):
+            n += int(v.shape[0])
+    return n
+
+
+def _auto_batch_probe_step(model, batch, device, args, use_amp, amp_dtype) -> None:
+    """One training forward + backward (no optimizer step) of a collated batch, as in the training loop."""
+    model_args, model_kwargs = batch_model_inputs(batch, device)
+    y = batch["y"].to(device, non_blocking=True).float().view(-1)
+    ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp) if device.type == "cuda" else nullcontext()
+    with ctx:
+        logits = model(*model_args, **model_kwargs, edge_dropout_p=float(args.edge_dropout),
+                       feature_noise_std=float(args.feat_noise_std)).view_as(y)
+    F.binary_cross_entropy_with_logits(logits.float(), y).backward()
+    model.zero_grad(set_to_none=True)
+
+
+def choose_auto_batch_size(model, train_ds, device, args, use_amp, amp_dtype) -> Tuple[int, str]:
+    """Largest-throughput per-GPU batch among --auto-batch-candidates whose worst-case batch (the B largest graphs of
+    a random pool of --auto-batch-pool training events) stays under --auto-batch-mem-frac of the GPU memory. Among
+    the sizes within --auto-batch-tolerance of the best throughput the smallest wins (less learning-rate
+    extrapolation). Same rule as train_SegmentClassifier.py. Without CUDA: the smallest candidate."""
+    cands = sorted(set(int(c) for c in args.auto_batch_candidates))
+    if device.type != "cuda":
+        return cands[0], "no CUDA device: smallest candidate"
+    rng = np.random.default_rng(12345)
+    n_pool = min(int(args.auto_batch_pool), len(train_ds))
+    pool_idx = rng.choice(len(train_ds), size=n_pool, replace=False)
+    pool = [train_ds[int(i)] for i in pool_idx]
+    by_size = sorted(range(n_pool), key=lambda i: -_graph_size(pool[i]))
+    total = torch.cuda.get_device_properties(device).total_memory
+    budget = float(args.auto_batch_mem_frac) * total
+    was_training = model.training
+    model.train()
+    results = []
+    for B in cands:
+        if B > n_pool:
+            break
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            worst = collate_graphs([pool[i] for i in by_size[:B]])
+            _auto_batch_probe_step(model, worst, device, args, use_amp, amp_dtype)
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device)
+            batches = [collate_graphs([pool[int(i)] for i in rng.choice(n_pool, size=B, replace=False)])
+                       for _ in range(7)]
+            for b in batches[:2]:  # warm-up (kernel selection, allocator)
+                _auto_batch_probe_step(model, b, device, args, use_amp, amp_dtype)
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            for b in batches[2:]:
+                _auto_batch_probe_step(model, b, device, args, use_amp, amp_dtype)
+            torch.cuda.synchronize(device)
+            eps = 5 * B / max(time.perf_counter() - t0, 1e-9)
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            results.append((B, float("inf"), 0.0))
+            break
+        results.append((B, peak, eps))
+        if peak > budget:
+            break
+    model.train(was_training)
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    fits = [(B, peak, eps) for B, peak, eps in results if peak <= budget]
+    table = " ".join(f"{B}:{eps:.0f}ev/s,{peak / 2**30:.2f}GB" if np.isfinite(peak) else f"{B}:OOM"
+                     for B, peak, eps in results)
+    if not fits:
+        return cands[0], f"nothing fits {args.auto_batch_mem_frac:.0%} of {total / 2**30:.1f} GB ({table})"
+    best = max(eps for _, _, eps in fits)
+    chosen = min(B for B, _, eps in fits if eps >= (1.0 - float(args.auto_batch_tolerance)) * best)
+    return chosen, f"{table} | budget {budget / 2**30:.1f} GB"
+
+
 def build_scheduler(opt, args, steps_per_epoch: int):
     if args.lr_schedule == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -3450,8 +3548,30 @@ def add_training_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--no-time", dest="time", action="store_false")
 
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--batch-size", type=int, default=64,
-                    help="Graphs per optimizer step on each rank. Larger values reduce DDP synchronization overhead.")
+    ap.add_argument("--batch-size", type=batch_size_arg, default=64,
+                    help="Graphs per optimizer step on each rank. Larger values reduce DDP synchronization overhead. "
+                         "'auto': after the model is built, probe --auto-batch-candidates on the GPU and take the "
+                         "fastest that fits --auto-batch-mem-frac (the minimum over the DDP ranks).")
+    ap.add_argument("--auto-batch-candidates", type=int, nargs="+", default=[16, 32, 64, 128],
+                    help="--batch-size auto: per-GPU batch sizes to probe.")
+    ap.add_argument("--auto-batch-mem-frac", type=float, default=0.7,
+                    help="--batch-size auto: the worst-case batch (the B largest graphs of the probe pool) must "
+                         "stay under this fraction of the GPU memory.")
+    ap.add_argument("--auto-batch-tolerance", type=float, default=0.05,
+                    help="--batch-size auto: sizes within this fraction of the best throughput count as equal; "
+                         "the smallest of them wins.")
+    ap.add_argument("--auto-batch-pool", type=int, default=512,
+                    help="--batch-size auto: random training events read for the probe.")
+    ap.add_argument("--lr-batch-scaling", default="none", choices=["none", "sqrt", "linear"],
+                    help="Scale --lr from the global batch --lr-ref-batch to the global batch used (per-rank batch "
+                         "x ranks): lr*sqrt(G/ref) (Adam rule), lr*G/ref, or unchanged (default). When not none, "
+                         "--ema-decay is also defined at --lr-ref-batch (per step) and rescaled to keep its "
+                         "horizon in events.")
+    ap.add_argument("--lr-ref-batch", type=int, default=64,
+                    help="Global batch at which --lr (and --ema-decay) are defined when --lr-batch-scaling is not "
+                         "none.")
+    ap.add_argument("--lr-max", type=float, default=None,
+                    help="Upper limit on the lr after --lr-batch-scaling. Default: no limit.")
     ap.add_argument("--sampler-mix-files", type=int, default=-1,
                     help="Training batches mix the events of this many files (every file holds one sample, i.e. "
                          "one class). -1 (default): --max-open-h5-files for H5 parts, all files for packed parts; "
@@ -3599,6 +3719,12 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         raise ValueError(
             "Edge-aware GAT attention requires --layer-type gat_residual."
         )
+    if args.batch_size == "auto" and min(args.auto_batch_candidates) < 1:
+        raise SystemExit("--auto-batch-candidates must be >= 1.")
+    if args.lr_ref_batch < 1:
+        raise SystemExit("--lr-ref-batch must be >= 1.")
+    if args.lr_max is not None and args.lr_max <= 0:
+        raise SystemExit("--lr-max must be > 0.")
 
     try:
         faulthandler.enable(all_threads=True)
@@ -3776,7 +3902,6 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     )
 
     loader_kwargs = dict(
-        batch_size=args.batch_size,
         collate_fn=collate_graphs,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
@@ -3789,11 +3914,21 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             persistent_workers=args.persistent_workers,
             prefetch_factor=args.prefetch_factor,
         )
-    train_loader = DataLoader(train_ds, shuffle=False, sampler=train_sampler, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **loader_kwargs)
+    def make_loaders(batch_size: int):
+        kw = dict(loader_kwargs, batch_size=int(batch_size))
+        tl = DataLoader(train_ds, shuffle=False, sampler=train_sampler, **kw)
+        vl = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **kw)
+        if ddp_is_initialized() and len(tl) == 0:
+            raise RuntimeError(f"DDP training has 0 batches per rank (train_ds={len(train_ds)} "
+                               f"world_size={ddp_world_size()}).")
+        return tl, vl
 
-    if ddp_is_initialized() and len(train_loader) == 0:
-        raise RuntimeError(f"DDP training has 0 batches per rank (train_ds={len(train_ds)} world_size={ddp_world_size()}).")
+    # --batch-size auto: the batch is probed on the GPU once the model exists, the loaders are built after it
+    auto_batch = args.batch_size == "auto"
+    batch_size_mode = "auto" if auto_batch else "fixed"
+    train_loader = val_loader = None
+    if not auto_batch:
+        train_loader, val_loader = make_loaders(args.batch_size)
 
     if ddp_is_main():
         print(
@@ -3806,16 +3941,14 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
             f"threshold={args.threshold} target_fpr={args.target_fpr}",
             flush=True,
         )
-        print(
-            f"[i] batch_size_per_rank={args.batch_size} effective_global_batch_size="
-            f"{args.batch_size * ddp_world_size()} max_open_h5_files={args.max_open_h5_files}",
-            flush=True,
-        )
         mix_txt = ("single file per batch (legacy)" if mix_files == 1 else
                    "all files (global shuffle)" if mix_files == 0 else f"events of {mix_files} files shuffled together")
         print(f"[i] data={'packed parts' if packed_data else 'H5'} sampler: {mix_txt}", flush=True)
 
-    sample = next(iter(train_loader))
+    if auto_batch:
+        sample = collate_graphs([train_ds[i] for i in range(min(2, len(train_ds)))])
+    else:
+        sample = next(iter(train_loader))
     xdim = sample["x"].shape[1]
     edim = sample["edge_attr"].shape[1] if sample["edge_attr"].ndim == 2 else 5
     track_xdim = int(sample["track_x"].shape[1]) if args.use_tracks else 0
@@ -3862,6 +3995,52 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
         model.tr_asinh_scale.detach().cpu().numpy().reshape(-1).tolist() if track_xdim > 0 else None
     )
 
+    use_amp = bool(args.amp and device.type == "cuda")
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    if auto_batch:
+        auto_note = None
+        if args.resume and os.path.exists(save_path):
+            # a resumed run keeps the batch it started with (scheduler and EMA depend on it)
+            try:
+                prev = torch.load(str(save_path), map_location="cpu", weights_only=False)
+            except TypeError:
+                prev = torch.load(str(save_path), map_location="cpu")
+            if prev.get("batch_size"):
+                args.batch_size = int(prev["batch_size"])
+                auto_note = f"from checkpoint {save_path}"
+            del prev
+        if args.batch_size == "auto":
+            args.batch_size, auto_note = choose_auto_batch_size(model, train_ds, device, args, use_amp, amp_dtype)
+        if ddp_is_initialized():
+            bt = torch.tensor([int(args.batch_size)], device=device, dtype=torch.long)
+            dist.all_reduce(bt, op=dist.ReduceOp.MIN)
+            args.batch_size = int(bt.item())
+        if ddp_is_main():
+            print(f"[auto-batch] batch_size={args.batch_size} ({auto_note})", flush=True)
+        train_loader, val_loader = make_loaders(args.batch_size)
+    global_batch = int(args.batch_size) * ddp_world_size()
+    # --lr (and, with scaling, --ema-decay per step) are defined at the global batch --lr-ref-batch
+    args.lr_base = float(args.lr)
+    args.ema_decay_base = float(args.ema_decay)
+    lr_factor = {"none": 1.0, "sqrt": math.sqrt(global_batch / args.lr_ref_batch),
+                 "linear": global_batch / args.lr_ref_batch}[args.lr_batch_scaling]
+    args.lr = args.lr_base * lr_factor
+    lr_capped = args.lr_max is not None and args.lr > float(args.lr_max)
+    if lr_capped:
+        args.lr = float(args.lr_max)
+    if args.lr_batch_scaling != "none":
+        args.ema_decay = args.ema_decay_base ** (global_batch / args.lr_ref_batch)
+    if ddp_is_main():
+        print(
+            f"[i] batch_size_per_rank={args.batch_size} effective_global_batch_size="
+            f"{global_batch} max_open_h5_files={args.max_open_h5_files} batch_size_mode={batch_size_mode}",
+            flush=True,
+        )
+        if args.lr_batch_scaling != "none":
+            print(f"[i] lr={args.lr:.6g} (base {args.lr_base:.6g} x {lr_factor:.3f}, {args.lr_batch_scaling} from "
+                  f"global batch {args.lr_ref_batch}{', capped at --lr-max' if lr_capped else ''}) "
+                  f"ema_decay={args.ema_decay:.6f} (base {args.ema_decay_base:g} at {args.lr_ref_batch})", flush=True)
+
     if ddp_is_initialized():
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -3898,8 +4077,6 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
     criterion = build_classification_loss(args, pos_weight_tensor=pos_weight_tensor)
 
     scheduler = build_scheduler(opt, args, steps_per_epoch=len(train_loader))
-    use_amp = bool(args.amp and device.type == "cuda")
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
     ema = EMA.create(model, decay=args.ema_decay) if args.ema else None
 
@@ -4146,6 +4323,13 @@ def run_training(args, *, task_name: str = "displaced_vertex_classification"):
                     "edge_update": args.edge_update,
                     "readout": args.readout,
                     "readout_heads": int(args.readout_heads),
+                    "batch_size": int(args.batch_size),
+                    "batch_size_mode": batch_size_mode,
+                    "global_batch_size": int(global_batch),
+                    "lr_base": float(args.lr_base),
+                    "lr_batch_scaling": args.lr_batch_scaling,
+                    "lr_ref_batch": int(args.lr_ref_batch),
+                    "lr_max": args.lr_max,
                     "sampler_mix_files": int(mix_files),
                     "packed_data": bool(packed_data),
                     "hidden_dim": args.hidden_dim,
